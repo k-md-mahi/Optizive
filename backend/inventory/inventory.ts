@@ -1,0 +1,405 @@
+"use server";
+
+import { auth } from "@/backend/auth/auth";
+import prisma from "@/lib/prisma";
+import { Category, StockUnit } from "@/prisma/generated/prisma/client";
+import { uploadImage, deleteImageByUrl } from "@/lib/cloudinary";
+
+export type InventoryStockStatus = "IN_STOCK" | "LOW_STOCK" | "OUT_OF_STOCK" | "INACTIVE";
+
+export interface InventoryQuery {
+  search?: string;
+  category?: Category | "ALL";
+  status?: InventoryStockStatus | "ALL";
+  sort?: "updated" | "name" | "price" | "quantity";
+  order?: "asc" | "desc";
+  minPrice?: number | null;
+  maxPrice?: number | null;
+  activeOnly?: boolean;
+  limit?: number;
+  offset?: number;
+}
+
+export interface InventoryProduct {
+  id: string;
+  name: string;
+  description: string | null;
+  category: Category | null;
+  sellingPrice: number;
+  costPrice: number;
+  quantity: number;
+  unit: StockUnit;
+  minStock: number | null;
+  sku: string | null;
+  barcode: string | null;
+  imageLink: string | null;
+  isActive: boolean;
+  createdAt: string;
+  updatedAt: string;
+  stockStatus: InventoryStockStatus;
+  margin: number;
+  value: number;
+}
+
+export interface InventoryCategoryOption {
+  value: Category;
+  label: string;
+}
+
+export interface UpdateProductPayload {
+  name?: string;
+  description?: string | null;
+  category?: Category | null;
+  sellingPrice?: number;
+  costPrice?: number;
+  quantity?: number;
+  unit?: StockUnit;
+  minStock?: number | null;
+  sku?: string | null;
+  barcode?: string | null;
+  isActive?: boolean;
+  imageBase64?: string | null;
+}
+
+export interface InventoryStats {
+  totalValue: number;
+  totalProducts: number;
+  lowStock: number;
+  outOfStock: number;
+  inactive: number;
+}
+
+export interface InventoryResponse {
+  items: InventoryProduct[];
+  totalCount: number;
+  overallCount: number;
+  categories: InventoryCategoryOption[];
+  stats: InventoryStats;
+}
+
+const CATEGORY_LABELS: Record<Category, string> = {
+  [Category.GROCERIES]: "Groceries",
+  [Category.FMCG]: "FMCG",
+  [Category.FRESH_PRODUCE]: "Fresh Produce",
+  [Category.AGRO_PRODUCTS]: "Agro Products",
+  [Category.FISHERY_SEAFOOD]: "Fishery & Seafood",
+  [Category.MEAT_POULTRY]: "Meat & Poultry",
+  [Category.DAIRY]: "Dairy",
+  [Category.ELECTRONICS]: "Electronics",
+  [Category.MOBILE_ACCESSORIES]: "Mobile Accessories",
+  [Category.CLOTHING]: "Clothing",
+  [Category.TEXTILES_APPAREL]: "Textiles & Apparel",
+  [Category.FOOTWEAR]: "Footwear",
+  [Category.BEAUTY_PERSONAL_CARE]: "Beauty & Personal Care",
+  [Category.HOME_APPLIANCE]: "Home Appliance",
+  [Category.FURNITURE]: "Furniture",
+  [Category.HARDWARE]: "Hardware",
+  [Category.CONSTRUCTION_MATERIALS]: "Construction Materials",
+  [Category.AUTO_PARTS]: "Auto Parts",
+  [Category.PHARMACY]: "Pharmacy",
+  [Category.STATIONERY]: "Stationery",
+  [Category.OFFICE_SUPPLIES]: "Office Supplies",
+  [Category.PACKAGING]: "Packaging",
+  [Category.CHEMICALS]: "Chemicals",
+  [Category.PLASTICS]: "Plastics",
+  [Category.RESTAURANT_SUPPLY]: "Restaurant Supply",
+  [Category.HOSPITALITY_SUPPLY]: "Hospitality Supply",
+  [Category.OTHER]: "Other",
+};
+
+function getCategoryOptions(): InventoryCategoryOption[] {
+  return Object.values(Category).map((value) => ({
+    value,
+    label: CATEGORY_LABELS[value] ?? "Other",
+  }));
+}
+
+function getStockStatus(product: {
+  isActive: boolean;
+  quantity: number;
+  minStock: number | null;
+}): InventoryStockStatus {
+  if (!product.isActive) return "INACTIVE";
+  if (product.quantity <= 0) return "OUT_OF_STOCK";
+  if (product.minStock !== null && product.quantity <= product.minStock) return "LOW_STOCK";
+  return "IN_STOCK";
+}
+
+function buildSearchWhere(search: string) {
+  if (!search) return undefined;
+  return {
+    OR: [
+      { name: { contains: search, mode: "insensitive" as const } },
+      { description: { contains: search, mode: "insensitive" as const } },
+      { sku: { contains: search, mode: "insensitive" as const } },
+      { barcode: { contains: search, mode: "insensitive" as const } },
+    ],
+  };
+}
+
+export async function listInventoryProducts(query: InventoryQuery): Promise<InventoryResponse | null> {
+  const session = await auth();
+  const userId = session?.user?.id;
+  if (!userId) return null;
+
+  const search = query.search?.trim() ?? "";
+  const category = query.category ?? "ALL";
+  const status = query.status ?? "ALL";
+  const sort = query.sort ?? "updated";
+  const order = query.order ?? "desc";
+  const activeOnly = query.activeOnly ?? false;
+  const baseLimit = query.limit ?? 20;
+  const limit = status === "LOW_STOCK" ? Math.min(baseLimit * 3, 100) : Math.min(baseLimit, 100);
+  const offset = query.offset ?? 0;
+  const sellingPriceFilter: { gte?: number; lte?: number } = {};
+
+  if (query.minPrice !== null && query.minPrice !== undefined) {
+    sellingPriceFilter.gte = query.minPrice;
+  }
+
+  if (query.maxPrice !== null && query.maxPrice !== undefined) {
+    sellingPriceFilter.lte = query.maxPrice;
+  }
+
+  const searchWhere = buildSearchWhere(search);
+  
+  const where: any = {
+    ownerId: userId,
+    ...(searchWhere ? searchWhere : {}),
+    ...(category !== "ALL" ? { category } : {}),
+    ...(Object.keys(sellingPriceFilter).length > 0 ? { sellingPrice: sellingPriceFilter } : {}),
+  };
+
+  // Apply status filters
+  if (status === "INACTIVE") {
+    where.isActive = false;
+  } else if (status === "IN_STOCK") {
+    where.isActive = true;
+    where.quantity = { gt: 0 };
+  } else if (status === "LOW_STOCK") {
+    where.isActive = true;
+    where.minStock = { not: null };
+    where.quantity = { gt: 0 };
+  } else if (status === "OUT_OF_STOCK") {
+    where.isActive = true;
+    where.quantity = { lte: 0 };
+  } else if (activeOnly) {
+    // Only apply activeOnly filter when no specific status is selected
+    where.isActive = true;
+  }
+
+  const orderBy =
+    sort === "name"
+      ? { name: order }
+      : sort === "price"
+      ? { sellingPrice: order }
+      : sort === "quantity"
+      ? { quantity: order }
+      : { updatedAt: order };
+
+  const [items, rawCount, overallCount, statsResult] = await Promise.all([
+    prisma.product.findMany({
+      where,
+      orderBy,
+      take: limit,
+      skip: offset,
+    }),
+    prisma.product.count({ where }),
+    prisma.product.count({ where: { ownerId: userId } }),
+    prisma.$queryRawUnsafe<Array<{
+      totalValue: number;
+      totalProducts: number;
+      lowStock: number;
+      outOfStock: number;
+      inactive: number;
+    }>>(
+      `SELECT
+        COALESCE(SUM("sellingPrice" * "quantity"), 0) as "totalValue",
+        COUNT(*) as "totalProducts",
+        COUNT(*) FILTER (WHERE "isActive" = false) as "inactive",
+        COUNT(*) FILTER (WHERE "isActive" = true AND "quantity" <= 0) as "outOfStock",
+        COUNT(*) FILTER (WHERE "isActive" = true AND "minStock" IS NOT NULL AND "quantity" > 0 AND "quantity" <= "minStock") as "lowStock"
+      FROM "Product"
+      WHERE "ownerId" = $1`,
+      userId,
+    ),
+  ]);
+
+  const filteredItems =
+    status === "LOW_STOCK"
+      ? items.filter((item) => item.minStock !== null && item.quantity > 0 && item.quantity <= item.minStock)
+      : items;
+
+  const totalCount = status === "LOW_STOCK" ? filteredItems.length : rawCount;
+
+  const products = filteredItems.map((product) => {
+    const stockStatus = getStockStatus({
+      isActive: product.isActive,
+      quantity: product.quantity,
+      minStock: product.minStock,
+    });
+    const margin = Number((product.sellingPrice - product.costPrice).toFixed(2));
+    const value = Number((product.sellingPrice * product.quantity).toFixed(2));
+
+    return {
+      id: product.id,
+      name: product.name,
+      description: product.description ?? null,
+      category: product.category ?? null,
+      sellingPrice: product.sellingPrice,
+      costPrice: product.costPrice,
+      quantity: product.quantity,
+      unit: product.unit,
+      minStock: product.minStock,
+      sku: product.sku ?? null,
+      barcode: product.barcode ?? null,
+      imageLink: product.imageLink ?? null,
+      isActive: product.isActive,
+      createdAt: product.createdAt.toISOString(),
+      updatedAt: product.updatedAt.toISOString(),
+      stockStatus,
+      margin,
+      value,
+    } satisfies InventoryProduct;
+  });
+
+  const serverStats = Array.isArray(statsResult) ? statsResult[0] : statsResult;
+
+  return {
+    items: products,
+    totalCount,
+    overallCount,
+    categories: getCategoryOptions(),
+    stats: {
+      totalValue: Number(serverStats?.totalValue) || 0,
+      totalProducts: Number(serverStats?.totalProducts) || 0,
+      lowStock: Number(serverStats?.lowStock) || 0,
+      outOfStock: Number(serverStats?.outOfStock) || 0,
+      inactive: Number(serverStats?.inactive) || 0,
+    },
+  };
+}
+
+export async function getProductById(productId: string): Promise<InventoryProduct | null> {
+  const session = await auth();
+  const userId = session?.user?.id;
+  if (!userId) return null;
+
+  const product = await prisma.product.findUnique({
+    where: { id: productId, ownerId: userId },
+  });
+
+  if (!product) return null;
+
+  const stockStatus = getStockStatus({
+    isActive: product.isActive,
+    quantity: product.quantity,
+    minStock: product.minStock,
+  });
+
+  const margin = Number((product.sellingPrice - product.costPrice).toFixed(2));
+  const value = Number((product.sellingPrice * product.quantity).toFixed(2));
+
+  return {
+    id: product.id,
+    name: product.name,
+    description: product.description ?? null,
+    category: product.category ?? null,
+    sellingPrice: product.sellingPrice,
+    costPrice: product.costPrice,
+    quantity: product.quantity,
+    unit: product.unit,
+    minStock: product.minStock,
+    sku: product.sku ?? null,
+    barcode: product.barcode ?? null,
+    imageLink: product.imageLink ?? null,
+    isActive: product.isActive,
+    createdAt: product.createdAt.toISOString(),
+    updatedAt: product.updatedAt.toISOString(),
+    stockStatus,
+    margin,
+    value,
+  };
+}
+
+export async function updateProduct(
+  productId: string,
+  data: UpdateProductPayload,
+): Promise<InventoryProduct | null> {
+  const session = await auth();
+  const userId = session?.user?.id;
+  if (!userId) return null;
+
+  const existing = await prisma.product.findUnique({
+    where: { id: productId, ownerId: userId },
+    select: { id: true, imageLink: true },
+  });
+  if (!existing) return null;
+
+  let imageLink = existing.imageLink;
+
+  if (data.imageBase64 === null) {
+    if (imageLink) {
+      await deleteImageByUrl(imageLink).catch(() => {});
+    }
+    imageLink = null;
+  } else if (data.imageBase64) {
+    if (imageLink) {
+      await deleteImageByUrl(imageLink).catch(() => {});
+    }
+    imageLink = await uploadImage(data.imageBase64, "products", {
+      width: 800,
+      height: 800,
+      crop: "fill",
+    });
+  }
+
+  const updateData: Record<string, unknown> = {};
+  if (data.name !== undefined) updateData.name = data.name;
+  if (data.description !== undefined) updateData.description = data.description;
+  if (data.category !== undefined) updateData.category = data.category;
+  if (data.sellingPrice !== undefined) updateData.sellingPrice = data.sellingPrice;
+  if (data.costPrice !== undefined) updateData.costPrice = data.costPrice;
+  if (data.quantity !== undefined) updateData.quantity = data.quantity;
+  if (data.unit !== undefined) updateData.unit = data.unit;
+  if (data.minStock !== undefined) updateData.minStock = data.minStock;
+  if (data.sku !== undefined) updateData.sku = data.sku;
+  if (data.barcode !== undefined) updateData.barcode = data.barcode;
+  if (data.isActive !== undefined) updateData.isActive = data.isActive;
+  if (imageLink !== existing.imageLink) updateData.imageLink = imageLink;
+
+  const updated = await prisma.product.update({
+    where: { id: productId },
+    data: updateData,
+  });
+
+  const stockStatus = getStockStatus({
+    isActive: updated.isActive,
+    quantity: updated.quantity,
+    minStock: updated.minStock,
+  });
+
+  const margin = Number((updated.sellingPrice - updated.costPrice).toFixed(2));
+  const value = Number((updated.sellingPrice * updated.quantity).toFixed(2));
+
+  return {
+    id: updated.id,
+    name: updated.name,
+    description: updated.description ?? null,
+    category: updated.category ?? null,
+    sellingPrice: updated.sellingPrice,
+    costPrice: updated.costPrice,
+    quantity: updated.quantity,
+    unit: updated.unit,
+    minStock: updated.minStock,
+    sku: updated.sku ?? null,
+    barcode: updated.barcode ?? null,
+    imageLink: updated.imageLink ?? null,
+    isActive: updated.isActive,
+    createdAt: updated.createdAt.toISOString(),
+    updatedAt: updated.updatedAt.toISOString(),
+    stockStatus,
+    margin,
+    value,
+  };
+}
