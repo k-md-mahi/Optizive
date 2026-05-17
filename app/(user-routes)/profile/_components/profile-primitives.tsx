@@ -20,6 +20,7 @@ export function CircularProgress({
   size = 56,
   stroke = 4,
   color = '#fff44f',
+  circleClassName,
   children,
 }: {
   value: number;
@@ -27,6 +28,7 @@ export function CircularProgress({
   size?: number;
   stroke?: number;
   color?: string;
+  circleClassName?: string;
   children?: React.ReactNode;
 }) {
   const pct = Math.min(Math.max((value / max) * 100, 0), 100);
@@ -42,11 +44,12 @@ export function CircularProgress({
           cy={size / 2}
           r={r}
           fill="none"
-          stroke={color}
+          stroke={circleClassName ? 'currentColor' : color}
           strokeWidth={stroke}
           strokeLinecap="round"
           strokeDasharray={c}
           strokeDashoffset={offset}
+          className={circleClassName}
           style={{ transition: 'stroke-dashoffset 700ms var(--ease-out-strong)' }}
         />
       </svg>
