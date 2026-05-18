@@ -3,12 +3,10 @@
 import { useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
-import {
-  LuLayoutDashboard,
-  LuPackage,
-  LuTrendingUp,
-  LuUser,
-} from 'react-icons/lu';
+import { FaUser } from "react-icons/fa";
+import { TbLayoutDashboardFilled, } from "react-icons/tb";
+import { FaCodeCompare, FaBoxesPacking, FaBasketShopping } from "react-icons/fa6";
+
 import SignOutButton from './SignOutButton';
 
 interface NavItem {
@@ -18,10 +16,11 @@ interface NavItem {
 }
 
 const navItems: NavItem[] = [
-  { label: 'Dashboard', href: '/dashboard', icon: LuLayoutDashboard },
-  { label: 'Inventory', href: '/inventory', icon: LuPackage },
-  { label: 'Price Compare', href: '/price-compare', icon: LuTrendingUp },
-  { label: 'Profile', href: '/profile', icon: LuUser },
+  { label: 'Dashboard', href: '/dashboard', icon: TbLayoutDashboardFilled },
+  { label: 'Inventory', href: '/inventory', icon: FaBoxesPacking },
+  { label: 'Smart Basket', href: '/smart-basket', icon: FaBasketShopping },
+  { label: 'Price Compare', href: '/price-compare', icon: FaCodeCompare },
+  { label: 'Profile', href: '/profile', icon: FaUser },
 ];
 
 interface SidebarProps {
@@ -121,11 +120,11 @@ export default function Sidebar({ mobileOpen = false, onMobileClose }: SidebarPr
               key={item.href}
               href={item.href}
               className={`
-                group relative flex items-center gap-3 px-3 py-2.5 rounded-full
+                group relative flex items-center gap-3 px-3 py-1 rounded-xl
                 transition-all duration-200 ease-out
                 ${
                   isActive
-                    ? 'bg-[rgba(58,181,173,0.10)] text-(--clr-teal-dim)'
+                    ? ' text-(--clr-teal-dim)'
                     : 'text-(--clr-fg-muted) hover:text-(--clr-fg) hover:bg-(--clr-surface)'
                 }
                 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-(--clr-teal-dim) focus-visible:ring-offset-2
