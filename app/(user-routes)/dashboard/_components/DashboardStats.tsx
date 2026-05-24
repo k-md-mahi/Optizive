@@ -1,26 +1,100 @@
 "use client";
 
+import { useEffect, useRef, useState } from "react";
 import { motion } from "motion/react";
-import { LuTrendingUp, LuTrendingDown, LuDollarSign, LuShoppingCart, LuPackage, LuTriangleAlert } from "react-icons/lu";
+import NumberFlow, { continuous, type Format } from "@number-flow/react";
+import {
+  LuTrendingUp,
+  LuTrendingDown,
+  LuDollarSign,
+  LuShoppingCart,
+  LuPackage,
+  LuTriangleAlert,
+} from "react-icons/lu";
 import type { DashboardStats as Stats } from "@/backend/dashboard/dashboard";
 
 interface DashboardStatsProps {
   stats: Stats;
 }
 
-function formatCurrency(value: number) {
-  return new Intl.NumberFormat("en-US", {
-    style: "currency",
-    currency: "BDT",
-    maximumFractionDigits: 0,
-  }).format(value);
+const EASE_OUT = [0.23, 1, 0.32, 1] as const;
+const compactFormat: Format = {
+  notation: "compact",
+  compactDisplay: "short",
+  roundingMode: "trunc",
+};
+const currencyFormat: Format = {
+  style: "currency",
+  currency: "BDT",
+  maximumFractionDigits: 0,
+};
+const numberTiming = {
+  duration: 900,
+  easing: "cubic-bezier(0.23, 1, 0.32, 1)",
+};
+const numberOpacityTiming = {
+  duration: 720,
+  easing: "cubic-bezier(0.23, 1, 0.32, 1)",
+};
+
+function StatValue({
+  value,
+  format,
+  delayMs,
+}: {
+  value: number;
+  format?: Format;
+  delayMs: number;
+}) {
+  const [ready, setReady] = useState(false);
+  const [flowValue, setFlowValue] = useState(0);
+  const hasAnimatedRef = useRef(false);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => setReady(true), delayMs);
+    return () => window.clearTimeout(timer);
+  }, [delayMs]);
+
+  useEffect(() => {
+    if (!ready) {
+      setFlowValue(0);
+      hasAnimatedRef.current = false;
+      return;
+    }
+
+    if (!hasAnimatedRef.current) {
+      hasAnimatedRef.current = true;
+      const frame = window.requestAnimationFrame(() => {
+        setFlowValue(value);
+      });
+
+      return () => window.cancelAnimationFrame(frame);
+    }
+
+    setFlowValue(value);
+  }, [ready, value]);
+
+  return (
+    <NumberFlow
+      willChange
+      plugins={[continuous]}
+      value={flowValue}
+      format={format ?? compactFormat}
+      locales="en-US"
+      animated={ready}
+      transformTiming={numberTiming}
+      spinTiming={numberTiming}
+      opacityTiming={numberOpacityTiming}
+    />
+  );
 }
 
 export function DashboardStats({ stats }: DashboardStatsProps) {
   const statCards = [
     {
       title: "Total Revenue",
-      value: formatCurrency(stats.totalRevenue),
+      value: stats.totalRevenue,
+      format: currencyFormat,
       change: stats.revenueChange,
       icon: LuDollarSign,
       color: "from-emerald-400 to-teal-500",
@@ -29,7 +103,7 @@ export function DashboardStats({ stats }: DashboardStatsProps) {
     },
     {
       title: "Total Sales",
-      value: stats.totalSales.toString(),
+      value: stats.totalSales,
       change: stats.salesChange,
       icon: LuShoppingCart,
       color: "from-blue-400 to-cyan-500",
@@ -38,7 +112,7 @@ export function DashboardStats({ stats }: DashboardStatsProps) {
     },
     {
       title: "Total Products",
-      value: stats.totalProducts.toString(),
+      value: stats.totalProducts,
       change: null,
       icon: LuPackage,
       color: "from-purple-400 to-pink-500",
@@ -47,7 +121,7 @@ export function DashboardStats({ stats }: DashboardStatsProps) {
     },
     {
       title: "Low Stock Items",
-      value: stats.lowStockProducts.toString(),
+      value: stats.lowStockProducts,
       change: null,
       icon: LuTriangleAlert,
       color: "from-amber-400 to-orange-500",
@@ -58,91 +132,81 @@ export function DashboardStats({ stats }: DashboardStatsProps) {
   ];
 
   return (
-    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+    <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-4">
       {statCards.map((card, index) => {
         const Icon = card.icon;
         const isPositive = card.change !== null && card.change >= 0;
-        
+        const delay = index * 0.08;
+        const numberDelayMs = Math.round((delay + 0.56) * 1000);
+
         return (
           <motion.div
             key={index}
-            initial={{ opacity: 0, y: 20 }}
+            initial={{ opacity: 0, y: 14 }}
             animate={{ opacity: 1, y: 0 }}
             transition={{
-              duration: 0.5,
-              delay: index * 0.1,
-              ease: [0.23, 1, 0.32, 1],
+              duration: 0.56,
+              delay,
+              ease: EASE_OUT,
             }}
-            className="bento-card bento-card-no-hover noise-overlay p-5 relative overflow-hidden"
+            className="group relative overflow-hidden rounded-3xl border border-(--clr-border) bg-(--clr-surface) p-5 shadow-[0_12px_40px_rgba(0,0,0,0.04)] transition-colors duration-300 hover:border-(--clr-border-hover) dark:shadow-[0_16px_50px_rgba(0,0,0,0.18)]"
           >
-            {/* Background gradient icon */}
-            <div className="absolute -right-4 -top-4 opacity-5">
-              <Icon className="w-32 h-32" />
+            <div className="noise-overlay absolute inset-0" />
+            <div
+              className={`absolute -right-10 -top-10 h-28 w-28 rounded-full bg-linear-to-br ${card.color} opacity-8 blur-2xl transition-opacity duration-500 group-hover:opacity-15`}
+            />
+            <div className="absolute -right-5 -top-5 opacity-[0.04] transition-transform duration-500 group-hover:scale-110 group-hover:rotate-6">
+              <Icon className="h-32 w-32" />
             </div>
 
             {/* Content */}
             <div className="relative z-10">
-              <div className="flex items-center justify-between mb-3">
-                <motion.div
-                  initial={{ scale: 0 }}
-                  animate={{ scale: 1 }}
-                  transition={{
-                    duration: 0.4,
-                    delay: index * 0.1 + 0.2,
-                    ease: [0.34, 1.56, 0.64, 1],
-                  }}
-                  className={`p-2.5 rounded-xl ${card.bgColor}`}
+              <div className="mb-4 flex items-center justify-between">
+                <div
+                  className={`rounded-2xl border border-white/10 p-2.5 shadow-inner ${card.bgColor}`}
                 >
-                  <Icon className={`w-5 h-5 ${card.textColor}`} />
-                </motion.div>
+                  <Icon className={`h-5 w-5 ${card.textColor}`} />
+                </div>
                 {card.change !== null && (
-                  <motion.div
-                    initial={{ opacity: 0, x: -10 }}
-                    animate={{ opacity: 1, x: 0 }}
-                    transition={{
-                      duration: 0.4,
-                      delay: index * 0.1 + 0.3,
-                    }}
-                    className={`flex items-center gap-1 text-xs font-semibold px-2 py-1 rounded-full ${
+                  <div
+                    className={`flex items-center gap-1 rounded-full px-2.5 py-1 text-xs font-semibold ${
                       isPositive
                         ? "bg-emerald-400/10 text-emerald-600 dark:text-emerald-400"
                         : "bg-rose-400/10 text-rose-600 dark:text-rose-400"
                     }`}
                   >
                     {isPositive ? (
-                      <LuTrendingUp className="w-3 h-3" />
+                      <LuTrendingUp className="h-3 w-3" />
                     ) : (
-                      <LuTrendingDown className="w-3 h-3" />
+                      <LuTrendingDown className="h-3 w-3" />
                     )}
                     {Math.abs(card.change).toFixed(1)}%
-                  </motion.div>
+                  </div>
                 )}
               </div>
 
-              <motion.div
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                transition={{
-                  duration: 0.4,
-                  delay: index * 0.1 + 0.4,
-                }}
-                className="space-y-1"
-              >
-                <p className="text-xs uppercase tracking-widest text-(--clr-fg-muted)">
+              <div className="space-y-1 leading-tight">
+                <p className="text-xs uppercase leading-tight tracking-[0.18em] text-(--clr-fg-muted)">
                   {card.title}
                 </p>
-                <p className="text-2xl font-bold text-(--clr-fg)">{card.value}</p>
+                <p className="text-3xl font-bold leading-tight tracking-tight text-(--clr-fg)">
+                  <StatValue
+                    value={card.value}
+                    format={card.format}
+                    delayMs={numberDelayMs}
+                  />
+                </p>
                 {card.change !== null && (
-                  <p className="text-[10px] text-(--clr-fg-muted)">
+                  <p className="text-[10px] leading-tight text-(--clr-fg-muted)">
                     vs previous 30 days
                   </p>
                 )}
                 {card.alert && (
-                  <p className="text-[10px] text-amber-600 dark:text-amber-400 font-medium">
+                  <p className="text-[10px] font-medium leading-tight text-amber-600 dark:text-amber-400">
                     Requires attention
                   </p>
                 )}
-              </motion.div>
+              </div>
             </div>
           </motion.div>
         );
