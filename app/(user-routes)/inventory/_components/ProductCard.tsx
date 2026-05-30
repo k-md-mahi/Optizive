@@ -1,11 +1,11 @@
 import Link from "next/link";
 
 import { StockBadge } from "./StockBadge";
+import { MiniSalesChart } from "./MiniSalesChart";
 import {
   CATEGORY_PALETTES,
   formatCategory,
   formatCurrency,
-  formatDate,
   type InventoryProduct,
   type ViewMode,
 } from "./types";
@@ -16,7 +16,7 @@ export function ProductCard({ product, view }: { product: InventoryProduct; view
   return (
     <Link
       href={`/inventory/${product.id}`}
-      className={`bento-card noise-overlay flex flex-col ${view === "large" ? "min-h-[380px]" : "min-h-[340px]"}`}
+      className={`bento-card noise-overlay flex flex-col cursor-pointer! ${view === "large" ? "min-h-95" : "min-h-85"}`}
     >
       {/* Square polaroid-style image */}
       <div className="w-full aspect-square border-b border-(--clr-border) relative p-4">
@@ -25,7 +25,6 @@ export function ProductCard({ product, view }: { product: InventoryProduct; view
           alt={product.name}
           className="w-full h-full object-cover rounded-lg"
           onError={(e) => {
-            // Fallback to gradient if image fails to load or no imageLink
             const target = e.target as HTMLImageElement;
             target.style.display = 'none';
             const fallback = target.nextElementSibling as HTMLElement;
@@ -34,7 +33,6 @@ export function ProductCard({ product, view }: { product: InventoryProduct; view
             }
           }}
           onLoad={(e) => {
-            // Ensure image is visible when it loads successfully
             const target = e.target as HTMLImageElement;
             target.style.display = 'block';
             const fallback = target.nextElementSibling as HTMLElement;
@@ -85,6 +83,14 @@ export function ProductCard({ product, view }: { product: InventoryProduct; view
               Min {product.minStock ?? "-"} &bull; Value {formatCurrency(product.value)}
             </div>
           </div>
+        </div>
+
+        {/* Sales Trend Chart */}
+        <div className="mt-2 pt-3 border-t border-(--clr-border)">
+          <div className="text-[9px] uppercase tracking-widest text-(--clr-fg-muted) mb-1">
+            Sales Trend (1 Month)
+          </div>
+          <MiniSalesChart productId={product.id} data={product.salesHistory} />
         </div>
       </div>
     </Link>

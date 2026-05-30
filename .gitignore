@@ -12,7 +12,8 @@
 
 # testing
 /coverage
-
+data/raw/
+*.csv
 # next.js
 /.next/
 /out/
