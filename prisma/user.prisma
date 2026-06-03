@@ -12,6 +12,7 @@ model User {
   password     String?
   profileImage String?
   businessName String?
+  businessSlug String? @unique
 
   role         UserRole     @default(NONE)
   businessType BusinessType?
@@ -76,8 +77,14 @@ model User {
   bundles             Bundle[]  @relation("BundleOwner")
   sales               Sale[]    @relation("SaleOwner")
   purchases           Sale[]    @relation("SaleBuyer")
+  stores              Store[]
   smartBaskets        SmartBasket[] @relation("SmartBasketOwner")
   priceCompareResults PriceCompareResult[]
+  chats               Chat[]
+  communityPosts       Post[]
+  communityComments    Comment[]
+  communityVotes       Vote[]
+  communityFulfillments Fulfillment[]
 
   @@index([role, district, primaryCategory])
   @@index([businessType, businessSize])
