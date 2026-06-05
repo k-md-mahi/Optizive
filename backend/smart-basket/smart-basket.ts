@@ -1,5 +1,8 @@
 "use server";
 
+import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
+import { generateText } from "ai";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 import { auth } from "@/backend/auth/auth";
 import prisma from "@/lib/prisma";
 import type { Category, StockUnit, BuyingPriority } from "@/prisma/generated/prisma/client";
@@ -387,17 +390,15 @@ function coercePickList(parsed: any): Array<{ id?: string; reason?: string; matc
   return null;
 }
 
-async function rankWithOpenRouter(
+const RANKING_SYSTEM_PROMPT =
+  "You are a retail basket pairing assistant. Return a JSON object only. No reasoning, no markdown.";
+
+function buildRankingPrompt(
   selected: SmartBasketProductSummary[],
   candidates: SmartBasketSuggestionItem[],
-): Promise<SmartBasketSuggestionItem[]> {
-  const apiKey = process.env.OPENROUTER_API_KEY;
-  if (!apiKey) return [];
-
-  const model = process.env.OPENROUTER_MODEL || "openrouter/free";
-  const categoryHint = getCategoryPromptHint(selected[0]?.category ?? null);
-
-  const prompt = {
+  categoryHint: string,
+) {
+  return {
     focus: categoryHint,
     selected: selected.map((item) => ({
       name: item.name,
@@ -422,81 +423,25 @@ async function rankWithOpenRouter(
       "No extra keys, no markdown.",
     ],
   };
+}
 
-  console.log("[SmartBasket AI] Request", JSON.stringify({ model, prompt }));
-
-  const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({
-      model,
-      temperature: 0.1,
-      max_tokens: 2000,
-      response_format: { type: "json_object" },
-      messages: [
-        {
-          role: "system",
-          content:
-            "You are a retail basket pairing assistant. Return a JSON object only. No reasoning, no markdown.",
-        },
-        {
-          role: "user",
-          content: JSON.stringify(prompt),
-        },
-      ],
-    }),
-  });
-
-  if (!response.ok) {
-    console.warn("[SmartBasket AI] Error", await response.text());
-    return [];
-  }
-
-  const data = (await response.json()) as any;
-  console.log("[SmartBasket AI] Raw", JSON.stringify(data));
-
-  if (data?.error) {
-    console.warn("[SmartBasket AI] Error payload", JSON.stringify(data.error));
-    return [];
-  }
-
-  if (data?.choices?.[0]?.finish_reason === "length") {
-    console.warn("[SmartBasket AI] Truncated response");
-  }
-
-  const message = data?.choices?.[0]?.message ?? data?.choices?.[0]?.delta ?? null;
-  const content = extractOpenRouterContent(message);
-  console.log("[SmartBasket AI] Response", content);
-
-  const fallbackText = typeof message?.reasoning === "string" ? message.reasoning : "";
-
-  if (!content) {
-    if (!fallbackText) {
-      console.warn("[SmartBasket AI] Empty content", JSON.stringify(data?.choices?.[0] ?? data));
-      return [];
-    }
-  }
+function parsePicksFromContent(content: string | null | undefined) {
+  if (!content) return null;
   const extractedJson = extractJsonSnippet(content) ?? content;
-  console.log("[SmartBasket AI] JSON", extractedJson);
-
   const parsed = safeJsonParse(extractedJson);
-  let picks = coercePickList(parsed);
+  return coercePickList(parsed);
+}
 
-  if (!picks && fallbackText) {
-    const fallbackJson = extractJsonSnippet(fallbackText) ?? fallbackText;
-    const fallbackParsed = safeJsonParse(fallbackJson);
-    picks = coercePickList(fallbackParsed);
-  }
-
+function mapPicksToSuggestions(
+  picks: Array<{ id?: string; reason?: string; matchScore?: number }> | null,
+  candidates: SmartBasketSuggestionItem[],
+): SmartBasketSuggestionItem[] {
   if (!picks) return [];
 
   const byId = new Map(candidates.map((item) => [item.id, item]));
   const aiResults: SmartBasketSuggestionItem[] = [];
 
-  picks.forEach((pick: { id?: string; reason?: string; matchScore?: number }) => {
+  picks.forEach((pick) => {
     if (!pick?.id) return;
     const match = byId.get(pick.id);
     if (!match) return;
@@ -511,6 +456,152 @@ async function rankWithOpenRouter(
   });
 
   return aiResults.slice(0, RECOMMENDATION_LIMIT);
+}
+
+async function rankWithOpenRouter(
+  selected: SmartBasketProductSummary[],
+  candidates: SmartBasketSuggestionItem[],
+): Promise<SmartBasketSuggestionItem[]> {
+  const apiKey = process.env.OPENROUTER_API_KEY;
+  if (!apiKey) return [];
+
+  const model = process.env.OPENROUTER_MODEL || "openrouter/free";
+  const categoryHint = getCategoryPromptHint(selected[0]?.category ?? null);
+  const prompt = buildRankingPrompt(selected, candidates, categoryHint);
+
+  console.log("[SmartBasket AI] Request (OpenRouter)", JSON.stringify({ model, prompt }));
+
+  const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model,
+      temperature: 0.1,
+      max_tokens: 2000,
+      response_format: { type: "json_object" },
+      messages: [
+        { role: "system", content: RANKING_SYSTEM_PROMPT },
+        { role: "user", content: JSON.stringify(prompt) },
+      ],
+    }),
+  });
+
+  if (!response.ok) {
+    console.warn("[SmartBasket AI] OpenRouter Error", await response.text());
+    return [];
+  }
+
+  const data = (await response.json()) as any;
+  console.log("[SmartBasket AI] Raw (OpenRouter)", JSON.stringify(data));
+
+  if (data?.error) {
+    console.warn("[SmartBasket AI] Error payload", JSON.stringify(data.error));
+    return [];
+  }
+
+  if (data?.choices?.[0]?.finish_reason === "length") {
+    console.warn("[SmartBasket AI] Truncated response");
+  }
+
+  const message = data?.choices?.[0]?.message ?? data?.choices?.[0]?.delta ?? null;
+  const content = extractOpenRouterContent(message);
+  console.log("[SmartBasket AI] Response (OpenRouter)", content);
+
+  const fallbackText = typeof message?.reasoning === "string" ? message.reasoning : "";
+
+  if (!content) {
+    if (!fallbackText) {
+      console.warn("[SmartBasket AI] Empty content", JSON.stringify(data?.choices?.[0] ?? data));
+      return [];
+    }
+  }
+
+  let picks = parsePicksFromContent(content);
+  if (!picks && fallbackText) {
+    picks = parsePicksFromContent(extractJsonSnippet(fallbackText) ?? fallbackText);
+  }
+
+  return mapPicksToSuggestions(picks, candidates);
+}
+
+async function rankWithOpenCodeCompatible(
+  selected: SmartBasketProductSummary[],
+  candidates: SmartBasketSuggestionItem[],
+): Promise<SmartBasketSuggestionItem[]> {
+  const apiKey = process.env.OPENCODE_KEY;
+  if (!apiKey) return [];
+
+  const model = process.env.OPENCODE_MODEL || "nemotron-3-super-free";
+  const categoryHint = getCategoryPromptHint(selected[0]?.category ?? null);
+  const prompt = buildRankingPrompt(selected, candidates, categoryHint);
+
+  console.log("[SmartBasket AI] Request (OpenCode)", JSON.stringify({ model, prompt }));
+
+  const client = createOpenAICompatible({
+    name: "opencode",
+    apiKey,
+    baseURL: "https://opencode.ai/zen/v1",
+  });
+
+  const { text } = await generateText({
+    model: client.chatModel(model),
+    messages: [
+      { role: "system", content: RANKING_SYSTEM_PROMPT },
+      { role: "user", content: JSON.stringify(prompt) },
+    ],
+    temperature: 0.1,
+    maxOutputTokens: 2000,
+  });
+
+  console.log("[SmartBasket AI] Response (OpenCode)", text);
+  const picks = parsePicksFromContent(text);
+  return mapPicksToSuggestions(picks, candidates);
+}
+
+async function rankWithGemini(
+  selected: SmartBasketProductSummary[],
+  candidates: SmartBasketSuggestionItem[],
+): Promise<SmartBasketSuggestionItem[]> {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) return [];
+
+  const modelName = process.env.GEMINI_MODEL || "gemini-2.0-flash";
+  const categoryHint = getCategoryPromptHint(selected[0]?.category ?? null);
+  const prompt = buildRankingPrompt(selected, candidates, categoryHint);
+
+  console.log("[SmartBasket AI] Request (Gemini)", JSON.stringify({ model: modelName, prompt }));
+
+  const genAI = new GoogleGenerativeAI(apiKey);
+  const model = genAI.getGenerativeModel({
+    model: modelName,
+    systemInstruction: RANKING_SYSTEM_PROMPT,
+    generationConfig: {
+      temperature: 0.1,
+      maxOutputTokens: 2000,
+      responseMimeType: "application/json",
+    },
+  });
+
+  const result = await model.generateContent(JSON.stringify(prompt));
+  const text = result.response.text();
+  console.log("[SmartBasket AI] Response (Gemini)", text);
+  const picks = parsePicksFromContent(text);
+  return mapPicksToSuggestions(picks, candidates);
+}
+
+type RankerFn = (
+  selected: SmartBasketProductSummary[],
+  candidates: SmartBasketSuggestionItem[],
+) => Promise<SmartBasketSuggestionItem[]>;
+
+function selectRanker(): RankerFn {
+  const aiUse = process.env.AI_USE;
+  if (aiUse === "2") return rankWithOpenCodeCompatible;
+  if (aiUse === "3") return rankWithGemini;
+  return rankWithOpenRouter;
 }
 
 export async function listRecentProducts(limit: number = DEFAULT_PRODUCT_LIMIT): Promise<SmartBasketProductSummary[] | null> {
@@ -976,7 +1067,7 @@ export async function getSmartBasketAiRecommendations(productIds: string[]): Pro
   const aiCandidates = scored
     .sort((a, b) => b.score - a.score)
     .slice(0, AI_CANDIDATE_LIMIT);
-  return rankWithOpenRouter(selectedSummaries, aiCandidates);
+  return selectRanker()(selectedSummaries, aiCandidates);
 }
 
 export async function getSmartBasketRecommendations(productIds: string[]): Promise<SmartBasketSuggestionsResponse | null> {
@@ -989,6 +1080,6 @@ export async function getSmartBasketRecommendations(productIds: string[]): Promi
   const aiCandidates = scored
     .sort((a, b) => b.score - a.score)
     .slice(0, AI_CANDIDATE_LIMIT);
-  const ai = await rankWithOpenRouter(selectedSummaries, aiCandidates);
+  const ai = await selectRanker()(selectedSummaries, aiCandidates);
   return { rule, ai };
 }
