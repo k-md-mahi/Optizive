@@ -2,325 +2,297 @@
 
 ## 1. Overview
 
-The **Price Compare** feature lets a user type a product name, pick a category, and (optionally) a city + country, and get back a side-by-side view of prices, sellers, the lowest ("best") price for buyers, and a recommended price range for sellers. The whole flow is built around a small Express backend that does the actual web scraping, and a Next.js frontend that talks to it through an internal proxy.
+The **Price Compare** feature lets a user type a product name, pick a category, and (optionally) a city plus country, and get back a side-by-side view of prices, sellers, the lowest price for buyers, and a recommended price range for sellers. The whole flow is built around a small backend that does the actual web scraping, and a frontend that calls it directly.
 
-It is split into three parts in the repo:
+The system is split into two logical parts:
 
-- **`api-express/`** — A standalone Node.js + Express + TypeScript service (deployed at `https://optizive-scrape.vercel.app`) that does the heavy lifting: search, scrape, LLM analysis.
-- **`op-new/app/(user-routes)/price-compare/`** — The Next.js page (UI, state, components).
-- **`op-new/backend/price-compare/price-compare.ts`** — A small client wrapper that issues the API call and returns the parsed `CompareResponse` to the React page.
-- **`op-new/app/api/price-compare/`** — Next.js Route Handlers that forward the request to the external backend (`/api/compare` → `https://optizive-scrape.vercel.app/api/compare`) and persist saved comparisons via Prisma/PostgreSQL.
+- **Scraping service** — A standalone Node.js + Express + TypeScript service (deployed on Vercel) that exposes a single public API and does the heavy lifting: search, scrape, and LLM analysis.
+- **Frontend page** — The Next.js page that renders the UI, holds the state, and is composed of several small presentational components. It calls the scraping service through a thin client wrapper.
 
-The frontend never talks to the Express backend directly in browser code — every request goes through a Next.js Route Handler. The handler forwards the request to the external service and, for "save" calls, performs the authenticated DB write.
+The frontend talks to the scraping service over a single endpoint on the Express app. The Express app owns the entire search, scrape, and analyse pipeline and returns a final JSON response.
 
 ---
 
-## 2. How the API Is Used
+## 2. How the Feature Is Used
 
-### 2.1 What data the frontend sends
+### 2.1 What the user provides
 
-The user fills a form with these fields (see `op-new/app/(user-routes)/price-compare/_components/CompareForm.tsx`):
+The user fills a form with the following fields:
 
-| Field         | Type     | Required | Example                                  |
-| ------------- | -------- | -------- | ---------------------------------------- |
-| `productName` | string   | yes      | `Aarong Full Cream Milk Powder 1kg`      |
-| `category`    | string   | yes      | `groceries` (one of 28 enum values)      |
-| `info`        | string   | no       | `1 kg pouch`                             |
-| `city`        | string   | no       | `Dhaka`                                  |
-| `country`     | string   | yes      | `Bangladesh` (human-readable full name)  |
+- **Product name** (required) — a free text field, for example *Aarong Full Cream Milk Powder 1kg*.
+- **Category** (required) — a dropdown with 28 predefined options such as *groceries*, *electronics*, *clothing*, *home appliances*, and so on.
+- **Info** (optional) — a small variant description, for example *1 kg pouch* or *256 GB Blue*.
+- **City** (optional) — used for localising the search and, for some categories, the weather context.
+- **Country** (required) — a human-readable full name like *Bangladesh* or *United States*. The UI presents it as a custom selector with a flag image.
 
-These are sent in the request body as JSON (`Content-Type: application/json`) to the Next.js Route Handler, which forwards them to the Express backend.
+These fields are sent in the request body as JSON to the scraping service.
 
 ### 2.2 Request flow
 
-1. **User submits form** → `CompareForm` calls `handleSubmit` in `page.tsx`.
-2. `page.tsx` builds a `CompareRequest` payload and calls `runCompare` (the wrapper in `op-new/backend/price-compare/price-compare.ts`).
-3. The wrapper does a `POST` to `/api/price-compare` (the Next.js Route Handler).
-4. The Next.js Route Handler (`op-new/app/api/price-compare/route.ts`) forwards the body to `https://optizive-scrape.vercel.app/api/compare` and returns the parsed `CompareResponse` back to the wrapper.
-5. The Express backend runs the full pipeline (search → scrape → LLM) and responds with the final JSON.
-6. The frontend applies the response to its state and, on success, posts the result to `/api/price-compare/save` (Next.js → Prisma → Postgres) so the user can reopen it later.
+1. The user submits the form and the page builds a payload with the form values.
+2. The page calls a small client wrapper that posts the body to the Express API.
+3. The Express service runs the full pipeline (search → scrape → LLM analysis) and returns a single final JSON response.
+4. The page applies the response to the on-screen state and renders the summary, market overview, and product grids.
+5. The full result is also added to the in-page cart so the user can reopen it later from the history panel.
 
 ---
 
-## 3. Backend Pipeline (Express)
+## 3. Scraping Service Pipeline
 
-The pipeline lives in `api-express/src/modules/compare/`. The full path for one request is:
+The scraping service is a small Express + TypeScript app. The full path for one request is:
 
-```
-validate body → buildSearchQuery → searchGoogleLinks → scrapePages (parallel) →
-  condenseScrapedData → analyzePrices (LLM) → sanitize & respond
-```
+> validate body → build search query → search Google links → scrape pages in parallel → condense scraped data → analyze prices with an LLM → sanitise and respond
 
-### 3.1 Query Builder — `queryBuilder.ts`
+### 3.1 Query Builder
 
-It takes the user's request and turns it into a single Google query:
+This stage takes the user request and turns it into a single Google query. The shape of the query is essentially:
 
-```
-"<productName> <info?> price <city?>, <country>"
-```
+> *product name* *optional info* *price* *city, country*
 
-Example: `Aarong Full Cream Milk Powder 1kg price Dhaka, Bangladesh`.
+For example: *Aarong Full Cream Milk Powder 1kg price Dhaka, Bangladesh*.
 
-Important detail: it intentionally avoids words like "compare" or "cheap" — the goal is to surface real product pages, then do the comparison ourselves.
+An important detail is that the builder intentionally avoids words like *compare* or *cheap*. The goal is to surface real product pages; the comparison itself is done downstream.
 
-### 3.2 Google Search via Serper — `googleScraper.ts`
+### 3.2 Google Search via Serper
 
-The backend calls the **Serper.dev** Google Search API:
+The service then calls the Serper.dev Google Search API:
 
-- **Endpoint:** `https://google.serper.dev/search`
-- **Method:** `POST`
-- **Headers:** `X-API-KEY: <SERPER_API_KEY>`
-- **Body:** `{ q: <query>, num: 10, gl: <country-tld> }`
+- **Endpoint** — a public Google Search proxy hosted by Serper.
+- **Method** — POST.
+- **Auth** — an API key sent in a custom header.
+- **Body** — the query, a result count cap, and a country-level geolocation hint.
 
 How the country is used:
-- A built-in `COUNTRY_TLD_MAP` converts the country name (e.g. `"Bangladesh"`) into a 2-letter TLD (`"bd"`).
-- That TLD is sent as the `gl` (geolocation) hint to Serper.
-- After the results come back, **every result's hostname is checked against the allowed TLD**, and any non-matching link is filtered out. This keeps results local.
+
+- A built-in mapping converts the country name (e.g. *Bangladesh*) into a 2-letter country code (*bd*).
+- That code is sent as the geolocation hint to Serper.
+- After the results come back, every result's hostname is checked against the allowed country code, and any non-matching link is filtered out. This keeps results local.
 - A small blocklist removes obvious non-product domains (Google, YouTube, Facebook, Wikipedia, Reddit, etc.).
-- Only one link per unique domain is kept, capped at 5 links.
+- Only one link per unique domain is kept, capped at five links.
 
-Output: a deduplicated, country-filtered list of product page URLs.
+The output is a deduplicated, country-filtered list of product page URLs.
 
-### 3.3 Firecrawl Web Scraping — `firecrawler.ts`
+### 3.3 Web Scraping via Firecrawl
 
-For each of the up to 5 URLs, the backend calls **Firecrawl** to extract structured product data.
+For each of the up to five URLs, the service calls Firecrawl to extract structured product data.
 
-- **Endpoint:** `https://api.firecrawl.dev/v1/scrape`
-- **Auth:** `Authorization: Bearer <FIRECRAWL_API_KEY>`
-- **Body fields used:** `url`, `formats: ['extract']`, `onlyMainContent: true`, `blockAds: true`, `proxy: 'basic'`, `timeout: 120000`, and a Firecrawl `extract` block with a custom `prompt` + `schema`.
+- **Endpoint** — Firecrawl's structured scrape endpoint.
+- **Auth** — a bearer token in the Authorization header.
+- **Body fields used** — the URL, a request for *extract* format, a flag to only return main content, an ad-block flag, a proxy mode, a long timeout, and a Firecrawl *extract* block with a custom prompt and a strict JSON schema.
 
 How Firecrawl is used:
-- The `extract.format` is set to `extract` so Firecrawl returns **structured JSON** (not just raw HTML/markdown).
-- The extract block includes a **prompt** that tells Firecrawl's LLM what to pull (e.g. "extract ALL products visible on this page, return price as a plain number, never invent values, normalize units").
-- It also includes a **strict JSON schema** that defines fields: `productName`, `brand`, `productUrl`, `imageUrl`, `availability` (`in_stock`/`out_of_stock`/null), `currency`, `price`, `originalPrice`, `discount`, `unitText`, `unitValue`, `unitName`. Extra fields are forbidden (`additionalProperties: false`).
-- The backend normalizes the response: relative URLs → absolute, currency defaults to `BDT`, availability mapped to the enum, numeric prices parsed.
-- **Parallel mode** is the default: URLs are round-robin distributed across Firecrawl API keys and scraped concurrently so the whole search finishes in one round trip.
-- The backend can also be set to **batch mode** (sequential groups of 3 with retry-on-failure) via `FIRECRAWL_SEND_BATCH=true`.
 
-Site metadata (favicon via `google.com/s2/favicons`, OG title, OG image) is also captured and attached to each page.
+- The extract format is set so Firecrawl returns structured JSON rather than raw HTML or markdown.
+- The extract block includes a prompt that tells Firecrawl's LLM what to pull (for example: *extract ALL products visible on this page, return price as a plain number, never invent values, normalise units*).
+- It also includes a strict JSON schema that defines fields like product name, brand, product URL, image URL, availability, currency, price, original price, discount, unit text, unit value, and unit name. Extra fields are forbidden.
+- The service normalises the response: relative URLs become absolute, currency defaults to a sensible fallback, availability is mapped to a fixed enum, and numeric prices are parsed carefully.
+- All URLs are scraped in parallel so the whole search finishes in a single round trip.
 
-### 3.4 Data Preprocessor — `dataPreprocessor.ts`
+Site metadata (favicon, page title, and Open Graph image) is also captured and attached to each scraped page so the UI can show logos and small touches.
 
-Firecrawl's raw product list is then cleaned and condensed:
+### 3.4 Data Preprocessor
 
-- For every scraped page, products are converted to a `ProductResult` with normalized fields (price, currency, unit, unit price, source, logo, match percentage).
-- A **strict match filter** keeps only products whose name tokenizes well against the user's input. The rules are:
-  - All numeric tokens (model numbers like `17`, `256`) must match exactly — this prevents `"iPhone 17"` matching `"iPhone 18"`.
-  - Non-numeric tokens need at least 50% overlap (or 100% for short queries).
-  - If the user filled the optional `info` field, at least one of those tokens must also match.
-- A **match percentage** (40–100) is calculated: a base score from token overlap, plus a small boost if `info` tokens also match.
-- The remaining products are turned into **compact one-line offer strings** of the form `product | price currency | unit`. These are the only thing the LLM sees.
-- There is a hard 14,000-character cap on the LLM input — if the offers exceed it, the rest is dropped.
-- If no products pass the strict filter, the first 3 products from the scrape are kept as a fallback so the user still gets something.
+Firecrawl's raw product list is then cleaned and condensed.
 
-### 3.5 LLM Analyzer — `llmAnalyzer.ts` and `llmCategoryPrompts.ts`
+- For every scraped page, products are converted to a normalised product record with fields like price, currency, unit, unit price, source, logo, and a match percentage.
+- A **strict match filter** keeps only products whose name tokenises well against the user's input. The rules are:
+  - All numeric tokens (model numbers like *17* or *256*) must match exactly — this prevents *"iPhone 17"* from matching *"iPhone 18"*.
+  - Non-numeric tokens need at least 50% overlap (or 100% for very short queries).
+  - If the user filled the optional info field, at least one of those tokens must also match.
+- A **match percentage** between 40 and 100 is calculated: a base score from token overlap, plus a small boost if info tokens also match.
+- The remaining products are turned into compact one-line offer strings of the form *product | price currency | unit*. These are the only thing the LLM sees.
+- There is a hard character cap on the LLM input — if the offers exceed it, the rest is dropped.
+- If no products pass the strict filter, the first few products from the scrape are kept as a fallback so the user still gets something to look at.
+
+### 3.5 LLM Analyzer
 
 This is the brain of the feature. It takes the compact offer lines and produces the pricing guidance shown to the user.
 
-- **LLM providers:** the backend can call any of three providers, picked at runtime:
-  - `AI_USE=1` (default) — **OpenRouter** with the model set in `OPENROUTER_MODEL` (uses `OPENROUTER_API_KEY`).
-  - `AI_USE=2` — **OpenCode** (model `nemotron-3-super-free` by default, `OPENCODE_KEY`).
-  - `AI_USE=3` — **Gemini** (model `gemini-2.0-flash` by default, `GEMINI_API_KEY`).
-  - All providers are called with `temperature: 0.05` and `response_format: { type: "json_object" }` for stable, deterministic JSON.
+- **LLM provider** — the service uses the **Gemini API** for all pricing analysis. Calls are made with a very low temperature and a forced JSON response format for stable, deterministic output.
 - The LLM is given a **category-aware system prompt** and a **structured user prompt**.
 
-#### Category-aware prompts (`llmCategoryPrompts.ts`)
+#### Category-aware prompts
 
-There are **28 product categories** in the enum, each with its own system prompt. A generic fallback is used for anything else. Some examples:
+There are **28 product categories**, each with its own system prompt. A generic fallback is used for anything else. Some examples of how the prompts differ:
 
-| Category key            | Has special prompt? | Seasonal-sensitive? | Focus                                                                |
-| ----------------------- | ------------------- | ------------------- | -------------------------------------------------------------------- |
-| `groceries`             | yes                 | yes                 | cut/prep, freshness, unit normalization, channel costs                |
-| `electronics`           | yes                 | no                  | specs, warranty, import vs grey market                               |
-| `raw_materials`         | yes                 | yes                 | grade, bulk sizing, per-unit normalization                           |
-| `clothing`              | yes                 | yes                 | material, brand tier, seasonal markdowns                             |
-| `home_appliances`       | yes                 | yes                 | capacity, energy, warranty                                           |
-| `beauty_personal_care`  | yes                 | no                  | authenticity, size normalization                                     |
-| `health_pharmacy`       | yes                 | no                  | dosage, pack size, per-unit                                          |
-| `baby_kids`             | yes                 | no                  | safety, size, per-unit                                               |
-| `books_stationery`      | yes                 | yes                 | edition, bundle, academic season                                     |
-| `sports_outdoors`       | yes                 | yes                 | material, season/event spikes                                        |
-| `tools_hardware`        | yes                 | no                  | durability, brand, set vs single                                     |
-| `automotive`            | yes                 | no                  | compatibility, OEM vs aftermarket                                     |
-| `furniture_home`        | yes                 | no                  | material, size, delivery                                             |
-| `pet_supplies`          | yes                 | no                  | nutrition, size, brand trust                                         |
-| `office_supplies`       | yes                 | no                  | pack size, B2B bulk                                                  |
-| `services`              | yes                 | no                  | duration, scope, quality tier                                        |
-| `electronics_accessories` | yes               | no                  | compatibility, OEM vs third-party                                    |
-| `mobiles_computing`     | yes                 | no                  | specs, variant, warranty, region lock                                |
-| `kitchen_dining`        | yes                 | no                  | material, set count, durability                                      |
-| `gifts_crafts`          | yes                 | yes                 | customization, festivals, seasonal                                   |
-| `travel_luggage`        | yes                 | yes                 | size, durability, brand                                              |
-| `garden_farm`           | yes                 | yes                 | pack size, planting season                                           |
-| `toys_games`            | yes                 | yes                 | age range, safety, licensing                                         |
-| `jewelry_watches`       | yes                 | yes                 | material, purity, authenticity                                       |
-| `music_instruments`     | yes                 | no                  | brand, condition, accessories                                        |
-| `industrial_equipment`  | yes                 | no                  | capacity, service contracts                                          |
-| `software_digital`      | yes                 | no                  | licensing, seats, compliance                                         |
-| `education_training`    | yes                 | yes                 | duration, certification, per-hour pricing                           |
+- *Groceries* — focused on cut/prep, freshness, unit normalisation, and channel effects. This category is seasonal-sensitive.
+- *Electronics* — focused on specs, warranty, import status. Not seasonal-sensitive.
+- *Raw materials* — focused on grade, bulk sizing, per-unit normalisation. Seasonal-sensitive.
+- *Clothing* — focused on material, brand tier, seasonal markdowns. Seasonal-sensitive.
+- *Home appliances* — focused on capacity, energy, warranty. Seasonal-sensitive.
+- *Beauty and personal care* — focused on authenticity, size normalisation.
+- *Health and pharmacy* — focused on dosage, pack size, per-unit.
+- *Baby and kids* — focused on safety, size, per-unit.
+- *Books and stationery* — focused on edition, bundle, academic season. Seasonal-sensitive.
+- *Sports and outdoors* — focused on material, season and event spikes. Seasonal-sensitive.
+- *Tools and hardware* — focused on durability, brand, set vs single.
+- *Automotive* — focused on compatibility, OEM vs aftermarket.
+- *Furniture and home* — focused on material, size, delivery.
+- *Pet supplies* — focused on nutrition, size, brand trust.
+- *Office supplies* — focused on pack size, B2B bulk.
+- *Services* — focused on duration, scope, quality tier.
+- *Electronics accessories* — focused on compatibility, OEM vs third-party.
+- *Mobiles and computing* — focused on specs, variant, warranty, region lock.
+- *Kitchen and dining* — focused on material, set count, durability.
+- *Gifts and crafts* — focused on customization, festivals, seasonal. Seasonal-sensitive.
+- *Travel and luggage* — focused on size, durability, brand. Seasonal-sensitive.
+- *Garden and farm* — focused on pack size, planting season. Seasonal-sensitive.
+- *Toys and games* — focused on age range, safety, licensing. Seasonal-sensitive.
+- *Jewelry and watches* — focused on material, purity, authenticity. Seasonal-sensitive.
+- *Music instruments* — focused on brand, condition, accessories.
+- *Industrial equipment* — focused on capacity, service contracts.
+- *Software and digital* — focused on licensing, seats, compliance.
+- *Education and training* — focused on duration, certification, per-hour pricing. Seasonal-sensitive.
 
-The full system prompt (built by `buildCompareAnalyzerSystemPrompt`) wraps the category prompt with strict rules:
+The full system prompt wraps the category prompt with strict rules:
 
-- The LLM is told to **only output valid JSON** with exactly four keys: `sellerPrice`, `bestPrice`, `summary`, `sellerSummary`.
-- `sellerPrice` is always a **range** in `"MIN-MAX CURRENCY"` or `"MIN-MAX CURRENCY/UNIT"` format.
-- `bestPrice` is the lowest offer with the same unit.
-- `summary` (3–5 sentences) covers product overview, price distribution, market clustering, units, and (for seasonal categories) seasonal/weather factors.
-- `sellerSummary` (3–5 sentences) covers pricing strategy (fast sale vs premium), profit-vs-speed tradeoff, market positioning, and risk factors.
-- **MRP / fixed-price categories** (electronics, mobiles, appliances, pharmacy, books, branded goods) keep `sellerPrice` at or above the credible market price with a narrow ±2–5% band.
+- The LLM is told to only output valid JSON with exactly four keys: *seller price*, *best price*, *summary*, and *seller summary*.
+- *Seller price* is always a range in the form *MIN-MAX CURRENCY* or *MIN-MAX CURRENCY/UNIT*.
+- *Best price* is the lowest offer with the same unit.
+- *Summary* (a few sentences) covers product overview, price distribution, market clustering, units, and, for seasonal categories, seasonal and weather factors.
+- *Seller summary* (a few sentences) covers pricing strategy (fast sale vs premium), profit-versus-speed tradeoff, market positioning, and risk factors.
+- **Fixed-price categories** (electronics, mobiles, appliances, pharmacy, books, branded goods) keep the seller price at or above the credible market price with a narrow band.
 - **Variable-price categories** (groceries, raw materials, garden, clothing, gifts) allow a sharper floor and a 75th-percentile cap.
-- If the category is **seasonal-sensitive**, the prompt also includes live **weather** and **season** context (see below). If not, the LLM is explicitly told to ignore weather/season.
+- If the category is seasonal-sensitive, the prompt also includes live **weather** and **season** context (see below). If not, the LLM is explicitly told to ignore weather and season.
 
-#### Weather & season enrichment
+#### Weather and season enrichment
 
-For seasonal-sensitive categories, the backend:
+For seasonal-sensitive categories, the service:
 
-- Calls the **Open-Meteo geocoding + forecast API** to get the current temperature and conditions for the user's city/country.
-- Computes the current **season** (`winter`/`spring`/`summer`/`autumn`) from the latitude and UTC month (meteorological seasons; southern hemisphere flipped).
-- Injects `{ weather, seasonal, nowUtc, categoryContextPolicy }` into the JSON user prompt so the LLM can reason about things like "winter is coming, AC prices usually drop".
+- Calls the **Open-Meteo geocoding and forecast API** to get the current temperature and conditions for the user's city and country.
+- Computes the current **season** (*winter*, *spring*, *summer*, *autumn*) from the latitude and the current UTC month, using meteorological seasons and flipping the southern hemisphere.
+- Injects this context into the user prompt so the LLM can reason about things like *winter is coming, AC prices usually drop*.
 
-The LLM still never *invents* numbers — it uses these signals only as a soft adjustment on top of the offers it already saw.
+The LLM still never invents numbers — it uses these signals only as a soft adjustment on top of the offers it already saw.
 
 #### Post-processing of the LLM output
 
-The LLM's JSON is validated with a Zod schema, then post-processed:
+The LLM's JSON is validated against a schema, then post-processed:
 
-- Products are split into **exact matches** (every original word present) and **related products** (at least one word present).
-- The unit suffix is auto-detected (`/kg`, `/pcs`, `/L`, etc.) and appended to prices when needed.
-- If the LLM didn't produce a `sellerPrice`, a deterministic fallback is computed from the offer list:
-  - Median price + best price for fixed-price categories.
+- Products are split into **exact matches** (every original word present in the product name) and **related products** (at least one word present).
+- The unit suffix is auto-detected (e.g. *per kg*, *per piece*, *per litre*) and appended to prices when needed.
+- If the LLM did not produce a seller price, a deterministic fallback is computed from the offer list:
+  - Median price plus best price for fixed-price categories.
   - 75th-percentile cap with a "fast sale" floor for variable-price categories.
 
 The result is what the user sees in the UI.
 
 ---
 
-## 4. Frontend (Next.js) — `op-new/app/(user-routes)/price-compare/`
+## 4. Frontend
 
-### 4.1 Stack & structure
+### 4.1 Stack and structure
 
-- **Framework:** Next.js 16 + React 19, all client-side (`"use client"`).
-- **State management:** A small `PriceCompareContext` (`_components/PriceCompareContext.tsx`) holds the response state and an `AbortController` ref for cancel. The page consumes it via `usePriceCompare()`.
-- **Animations:** `motion/react` (Framer Motion successor) for fade-up sections and per-card entry animations.
-- **Icons:** `react-icons/lu` (Lucide set).
-- **Country flags:** `flagcdn.com` (24x18 PNGs, keyed by the TLD from `COUNTRY_OPTIONS`).
+- **Framework** — Next.js + React, all client-side.
+- **State management** — A small context holds the response state and a cancellation reference. The page consumes it via a hook.
+- **Animations** — A small animation library is used for fade-up sections and per-card entry animations.
+- **Status card** — A pipeline status card shows the current stage, a progress indicator, the source count, and a collapsible list of the source URLs.
+- **Icons** — The Lucide icon set.
+- **Country flags** — A public flag image service, keyed by the country code from the country options list.
 
-File map:
+The page is composed of several focused components:
 
-```
-price-compare/
-├── page.tsx                       # Main page — state machine, submit, layout
-├── _components/
-│   ├── CompareForm.tsx            # Product/category/country form
-│   ├── PipelineStatus.tsx         # Status card with source accordion
-│   ├── PriceSummaryCards.tsx      # Best / Seller / Total cards
-│   ├── MarketOverview.tsx         # LLM summary + seller guidance block
-│   ├── ProductResults.tsx         # Exact + related product grids
-│   ├── ProductCard.tsx            # Single product card
-│   ├── PriceCompareHistory.tsx    # Slide-over panel for saved comparisons
-│   ├── PriceCompareContext.tsx    # State + AbortController
-│   ├── types.ts                   # TS types + COUNTRY_OPTIONS + CATEGORY_OPTIONS
-│   └── utils.ts                   # formatCurrency, stageTone, matchTone, etc.
-```
+- A form component that handles the user input and submission.
+- A status card that reflects the current stage, the progress, and a collapsible list of source URLs.
+- A summary cards block that shows the best price, the recommended seller range, and the total products found.
+- A market overview block that renders the buyer's summary and a highlighted seller guidance block.
+- A product results block with two grids: exact matches and related products.
+- A product card component for a single listing.
+- A slide-over history panel for the user's saved comparisons.
+- A small set of utility helpers for currency formatting, percentage colours, and stage colours.
+- A type file that holds the shared TypeScript types plus the list of country and category options.
 
 ### 4.2 What the user sees
 
-The page is a two-column layout (form on the left, results on the right, with the form becoming sticky on `xl` screens):
+The page is a two-column layout, with the form on the left and the results on the right, and the form becomes sticky on wide screens.
 
-1. **Header** — "Price Compare".
-2. **Compare form** — required product name, required category dropdown, optional info/variant, optional city, required country (custom flag selector). Includes a Cancel button and a Clear-form button.
-3. **Pipeline status card** — shows the current stage (Queued → Searching → Crawling → Analyzing → Complete), a progress indicator (`completed/total`), source count, query count, and a "View sources" accordion with the actual URLs.
-4. **Summary cards** — three bento cards:
-   - **Best price** — lowest buyer offer (e.g. `৳1,180` or `৳120/kg`).
-   - **Seller range** — recommended seller price range (e.g. `৳1,250-1,400`).
-   - **Total found** — total matched products across all sources.
-5. **Market overview** — the LLM's `summary` plus a highlighted "Seller guidance" block for `sellerSummary`.
-6. **Exact matches** — grid of product cards whose name contains every word of the user's input.
-7. **Related products** — grid of product cards that share at least one keyword.
-8. **Product card** details:
-   - Product image (or fallback icon)
-   - Source site + favicon (from Google favicon service) and availability pill (`in_stock` / `out_of_stock` / unknown)
-   - Product name (clamped to 2 lines)
-   - Price (formatted as currency), price-per-unit when available
-   - Match percentage with color-coded pill (green ≥85, yellow ≥70, orange <70)
-   - Unit (`kg`, `pcs`, `L`, etc.) and per-unit price
-   - "View listing" button that opens the source product page in a new tab
-9. **History panel** — slide-over drawer on the right showing the user's last 5 (or all) saved comparisons. Each entry shows product, category, country, and date. Clicking one reloads the form and rehydrates the result from the saved JSON in DB.
-10. **Saved comparisons** — if there are no live results yet, the main column shows the last 5 saved comparisons as quick-load buttons.
+1. **Header** — the page title.
+2. **Compare form** — required product name, required category dropdown, optional info and variant, optional city, required country selector with flag. Includes a Cancel button and a Clear-form button.
+3. **Status card** — shows the current stage (queued → searching → crawling → analysing → complete), a progress indicator, source count, query count, and a "View sources" accordion with the actual URLs.
+4. **Summary cards** — three small cards showing the best price for buyers, the recommended seller range, and the total products found across all sources.
+5. **Market overview** — the LLM's summary plus a highlighted seller guidance block.
+6. **Exact matches** — a grid of product cards whose name contains every word of the user's input.
+7. **Related products** — a grid of product cards that share at least one keyword.
+8. **Product card** — shows product image (or fallback icon), source site and favicon, an availability pill, the product name, the formatted price, a colour-coded match percentage, the unit, the per-unit price when available, and a "View listing" button that opens the source product page in a new tab.
+9. **History panel** — a slide-over drawer on the right showing the user's last five (or all) saved comparisons. Each entry shows product, category, country, and date. Clicking one reloads the form and rehydrates the result from the saved data.
+10. **Saved comparisons** — if there are no live results yet, the main column shows the last five saved comparisons as quick-load buttons.
 
-### 4.3 Save & history
+### 4.3 Save and history
 
-- **Save:** Every successful comparison is `POST`ed to `/api/price-compare/save` with the form values plus the full `CompareResponse` JSON. The Route Handler authenticates via `auth()` (NextAuth), then writes a `PriceCompareResult` row in PostgreSQL via Prisma.
-- **List:** `GET /api/price-compare/save` returns the user's saved comparisons (most recent first, only `id`, `productName`, `category`, `country`, `createdAt`).
-- **Load one:** `GET /api/price-compare/save/[id]` returns the full row including the embedded JSON result. The frontend rehydrates state from it.
+- Every successful comparison is also added to the user's in-page cart, so the user can reopen it later from the history panel without leaving the session.
 
-### 4.4 Backend-of-the-frontend connection (`op-new/backend/price-compare/price-compare.ts`)
+### 4.4 Backend-of-the-frontend connection
 
-This file is the bridge between the React page and the network. It exports a single function:
+A small client module is the bridge between the React page and the network. It exposes a single call that posts the form payload to the Express API and returns the parsed result.
 
-- `runCompare(payload, signal)` — does a `POST` to `/api/price-compare` (the Next.js Route Handler), validates the response, and returns the parsed `CompareResponse` to the React page. An `AbortSignal` can be used to cancel the request mid-flight.
-
-
+An abort signal can be passed in so the user can cancel the request mid-flight.
 
 ---
 
-## 5. Development / Build Info
+## 5. End-to-End Flow
 
-- **`api-express/`** — Node.js + Express 5 + TypeScript, deployed on Vercel. Runs `tsc` to build, `node dist/index.js` to start. Endpoints: `GET /health`, `POST /api/compare`. Validation: Zod + manual checks. Config in `src/config.ts` reads `FIRECRAWL_API_KEY`, `OPENROUTER_API_KEY`, `OPENROUTER_MODEL`, `SERPER_API_KEY`, `PORT`, `WEATHER_CONTEXT`, plus optional `AI_USE`, `OPENCODE_KEY`, `OPENCODE_MODEL`, `GEMINI_API_KEY`, `GEMINI_MODEL`.
-- **`op-new/`** — Next.js 16 + React 19 + TypeScript + Tailwind 4 + Prisma 7 + NextAuth 5. Uses `motion` for animations, `recharts` for other charts, `react-markdown` for rich text. Auth via NextAuth (session-based). Hosting platform: Vercel (route handlers in `app/api/`).
-- **DB:** PostgreSQL on Neon (`@neondatabase/serverless`).
-- **External APIs used:**
-  - **Serper.dev** — Google Search (1 call per compare)
-  - **Firecrawl** — product page extraction (up to 5 pages per compare, in parallel)
-  - **OpenRouter / OpenCode / Gemini** — pricing analysis LLM (1 call per compare)
-  - **Open-Meteo** — geocoding + current weather (only for seasonal-sensitive categories)
-- **Env vars on the Next.js side:** `PRICE_COMPARE_API_URL` (default `https://optizive-scrape.vercel.app`), `NEXT_PUBLIC_PRICE_COMPARE_API` (used by the client wrapper for the fallback direct call).
+1. The user opens the price-compare page, fills in the product, category, and (optionally) info, city, and country, and clicks **Compare prices**.
+2. The frontend posts the body to the Express API on the scraping service.
+3. The scraping service:
+   1. Validates the body (product name, category, country are required).
+   2. Builds a single Google query in the form *product info price city, country*.
+   3. Calls Serper.dev for Google results, sends the country code as a geolocation hint, then filters to one unique-domain link per site (up to five), restricted to the chosen country.
+   4. Calls Firecrawl in parallel on each link. Each Firecrawl call uses a custom extract prompt and a strict JSON schema, so the result is a clean set of structured products.
+   5. Runs a strict-match filter on every product (numeric tokens must match exactly, non-numeric tokens need a threshold of overlap, and the optional info field is sanity-checked). The survivors are turned into compact one-line offer strings, capped at a fixed character limit.
+   6. For seasonal categories, fetches the current weather from Open-Meteo and computes the local season.
+   7. Sends the offer lines to the **Gemini** LLM with a category-specific system prompt. The LLM returns only *seller price*, *best price*, *summary*, and *seller summary*.
+   8. Post-processes the result: splits products into exact and related, auto-detects the unit suffix, and computes a deterministic seller price fallback if the LLM missed it.
+   9. Returns the final response.
+4. The frontend applies the response to its state and renders the status card, the summary cards, the market overview, and the exact and related product grids.
+5. The full result is also added to the in-page cart, so it shows up in the history panel for the rest of the session.
 
----
+### 5.1 Workflow Diagram
 
-## 7. End-to-End Flow Diagram
+The chart below shows the full end-to-end flow at a glance.
 
 ```mermaid
-flowchart TD
-    A[User fills CompareForm] --> B[Click 'Compare prices']
-    B --> C[runCompare via /api/price-compare]
-    C --> D[Next.js Route Handler forwards POST]
-    D --> E[Express /api/compare]
-    E --> F[1. Build Google query]
-    F --> G[2. Serper.dev search]
-    G --> H[Filter by country TLD + blocklist + unique domains]
-    H --> I[3. Firecrawl scrape up to 5 URLs in parallel]
-    I --> J[4. DataPreprocessor: strict-match filter + compact offer lines]
-    J --> K{Seasonal category?}
-    K -- yes --> L[Open-Meteo weather + season context]
-    K -- no --> M[Skip weather]
-    L --> N[5. LLM via OpenRouter/OpenCode/Gemini]
-    M --> N
-    N --> O[Category-aware system prompt + JSON user prompt]
-    O --> P[Parse + Zod validate + post-process]
-    P --> Q[Return CompareResponse JSON]
-    Q --> R[Frontend updates UI]
-    R --> S[POST /api/price-compare/save]
-    S --> T[Prisma -> PostgreSQL PriceCompareResult]
-    R --> U[User can re-open from history later]
+flowchart TB
+    A([User fills the compare form<br/>product, category, info, city, country])
+    A --> B[Frontend posts the form to the Express API]
+    B --> C[Scraping service validates the body]
+    C --> D[Build a Google query<br/>product info price city, country]
+    D --> E[Call Serper.dev for Google results<br/>country-filtered, one link per domain, cap at 5]
+    E --> F[Scrape each link in parallel with Firecrawl<br/>structured product JSON]
+    F --> G[Strict match filter<br/>turn survivors into compact offer lines]
+
+    G --> H{Seasonal category?}
+    H -- yes --> I[Fetch Open-Meteo weather and local season]
+    H -- no  --> J
+    I --> J[Send offer lines plus context to the Gemini LLM<br/>with a category-specific system prompt]
+    G --> J
+
+    J --> K[Post-process the LLM result<br/>exact vs related products, unit suffix, fallback seller range]
+    K --> L[Return the final response to the frontend]
+    L --> M[Frontend renders the status card, summary cards, market overview, and product grids]
+    M --> N([Add to in-page cart so it shows up in the history panel])
 ```
+
+Key things to read off the chart:
+
+- The form submission flows **Frontend → Express API** and back as a single round trip.
+- Inside the scraping service, the only side branch is **weather**, which only runs for seasonal categories.
+- The **LLM step** is a single Gemini call that turns the offer lines into pricing guidance.
+- The final result is then **added to the in-page cart** for later reopening.
 
 ---
 
-## 8. Step-by-Step Summary (Quick Read)
+## 6. Step-by-Step Summary (Quick Read)
 
-1. User opens `/price-compare`, fills product + category + (optionally) info/city + country, and hits **Compare prices**.
-2. Frontend calls `runCompare`, which `POST`s the body to `/api/price-compare`.
-3. The Next.js Route Handler forwards the same body to `https://optizive-scrape.vercel.app/api/compare` and returns the JSON response.
-4. The Express backend:
-   1. Validates the body (product name, category, country required).
-   2. Builds a single Google query (`<product> <info> price <city, country>`).
-   3. Calls Serper.dev for Google results, sends the country TLD as `gl`, then filters to one unique-domain link per site (≤ 5), restricted to the chosen country.
-   4. Calls Firecrawl in parallel on each link. Each Firecrawl call uses a custom extract prompt + strict JSON schema so we get clean structured products (name, price, currency, unit, image, availability, brand, discount).
-   5. Runs a strict-match filter on every product (numeric tokens must match exactly, ≥50% non-numeric overlap, info-field sanity check) and turns the survivors into compact one-line offer strings (capped at 14k chars).
-   6. For seasonal categories, fetches the current weather from Open-Meteo and computes the local season.
-   7. Sends the offer lines to an LLM (OpenRouter by default) with a category-specific system prompt. The LLM returns only `{ sellerPrice, bestPrice, summary, sellerSummary }`.
-   8. Post-processes: splits products into exact vs related, auto-detects the unit suffix, computes a deterministic `sellerPrice` fallback if the LLM missed it.
-   9. Returns the final `CompareResponse` JSON.
-5. The wrapper returns the JSON to the React page, which applies it to the pipeline status, summary cards, market overview, and the exact/related product grids.
-6. The frontend also posts the full response (plus the form fields) to `/api/price-compare/save`, which writes a `PriceCompareResult` row in PostgreSQL via Prisma.
-7. The page re-fetches the history list so the latest comparison shows up in the "Saved Comparisons" / slide-over panel.
+- The user types a product, picks a category, optionally adds info and a city, and chooses a country.
+- The Next.js page sends this to the Express API on the scraping service.
+- The scraping service builds a Google search query, calls Serper.dev, and gets back a country-filtered, deduplicated list of up to five product page URLs.
+- It then calls Firecrawl in parallel on those URLs to extract clean, structured product data (name, price, currency, unit, image, availability, brand, discount, and so on).
+- It runs a strict token-based match filter, drops anything that does not look like the user's product, and packs the survivors into compact one-line offer strings.
+- For seasonal categories, it pulls current weather and season from Open-Meteo and feeds that into the LLM context.
+- It sends the offer lines to the **Gemini** LLM with a category-specific system prompt. The LLM returns only a seller price range, a best price, a buyer summary, and a seller guidance summary.
+- The result is post-processed, validated, split into exact and related products, and returned to the frontend.
+- The frontend renders the status card, the summary cards, the market overview, and the exact and related product grids.
+- The full result is also added to the in-page cart so it can be reopened from the history panel later.
+
+
+

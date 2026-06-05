@@ -1,177 +1,263 @@
-# OPTIZIVE — User Onboarding Module
-
-> Reference document for understanding the onboarding feature, its data model, and downstream usage. Written for internal use and project-report writing.
-
----
+# User Onboarding — Feature Documentation
 
 ## 1. Overview
 
-The onboarding module is the **first-time profile setup flow** that runs the moment a new user finishes sign-up. It is **not** a signup form — the user is already authenticated by the time they reach this page (validated by `auth()` in `app/onboarding/page.tsx:6`).
+The **Onboarding** feature is the first-time profile setup flow that runs the moment a new user finishes sign-up. It is **not** a signup form — the user is already authenticated by the time they reach this page. Its job is to collect the business and behavioural context that OPTIZIVE's matching engine needs, persist it to the user profile, and then mark the user as onboarded so the rest of the app becomes reachable.
 
-Its single job is to:
+The system is split into two logical parts:
 
-1. Collect the **business and behavioral context** that OPTIZIVE's matching engine needs to work.
-2. Persist that context to the `User` model in the database.
-3. Flip the `user.onboarded` flag to `true` so the user is allowed past the route guard into the dashboard (`app/onboarding/page.tsx:12`).
+- **Entry page** — A small server-rendered route guard that decides whether to render the form, send the user to sign-in, or skip onboarding altogether.
+- **Multi-tab form** — A client-side form that runs through the profile questions in three tabs, with role-conditional content and inline conversational styling. It is composed of a few small reusable pieces that render the answers inside running sentences.
+
+The whole flow ends with a short welcome panel and an auto-redirect into the main app.
 
 ### Design note
 
-The form is intentionally built as a **conversational, inline-style questionnaire** — one running sentence with inputs and dropdowns inline — rather than a traditional labeled grid. This is a UX choice to lower form fatigue on mobile. The data structure behind it, however, is strictly typed against the Prisma enums (`app/onboarding/_components/types.ts`).
+The form is intentionally built as a **conversational, inline-style questionnaire** — one running sentence with the answers inline — rather than a traditional labelled grid. This is a UX choice to lower form fatigue on mobile and to make the questionnaire feel less like an admin form and more like a guided chat. The data structure behind it, however, is strictly typed against the platform's category and business enums, and the user record is the same regardless of how the questions are asked.
 
 ---
 
-## 2. Route Guard & Entry Logic
+## 2. How the Feature Is Used
 
-File: `app/onboarding/page.tsx`
+### 2.1 Entry conditions
 
-- The page is a **server component** that runs `auth()` on the server before rendering anything.
-- If no session → `redirect("/login")`.
-- If `session.user.onboarded` is true **and** `role` is not `NONE` → `redirect("/dashboard")`.
-- Otherwise, the `<OnboardingForm>` client component is mounted with `initialName` pre-filled from the session.
+The onboarding flow is reached automatically when a freshly signed-up user lands on it. The entry page itself decides who actually sees the form:
 
-This means **onboarding is unreachable** for users who haven't signed in, and **bypassed** for users who have already completed it.
+- If the user is **not signed in**, they are sent to the sign-in page.
+- If the user is already **marked as onboarded and has a real role**, they are sent straight to the dashboard.
+- Otherwise, the multi-tab form is rendered with the user's name pre-filled from the session.
+
+In other words, the flow is **unreachable** for unauthenticated users and **skipped** for users who have already completed it. Every visit is decided by the route guard, so the user only ever sees the form once.
+
+### 2.2 The three-step flow
+
+The form is split into three tabs, and the user can move back and forth between them at any time. The steps are:
+
+1. **Personal Info** — name, phone, and the role the user is joining as.
+2. **Business Details** — the business identity, type, size, location, and product categories.
+3. **Preferences** — a role-conditional block of buyer and/or supplier preferences.
+
+The final step's **Complete Profile** button submits the form. On success, a small welcome panel appears and the user is automatically moved into the dashboard a few seconds later.
+
+### 2.3 What the user provides
+
+The user fills a multi-step questionnaire with the following groups of fields:
+
+- **Identity and contact** — display name, phone number, and the role being joined.
+- **Business identity** — business name, business type, business size, optional years in business, district, area, primary category, and optional sub-categories.
+- **Buyer preferences** (for buyers and dual-role users) — monthly purchase range, pricing preference, negotiation style, buying priority, restock frequency, preferred distance, and max delivery time.
+- **Supplier preferences** (for suppliers and dual-role users) — service area, service radius in kilometres, delivery method, delivery time range, pricing type, bulk discount availability, order capacity, and supplier tags.
+
+The complete list of fields, with descriptions and downstream usage, is in §4.
 
 ---
 
-## 3. Flow Architecture
+## 3. Form Pipeline
 
-The flow has **3 tabs** (`app/onboarding/onboarding-form.tsx:72-76`):
+The form is rendered as three tabs with role-conditional content. Behind the scenes, every step has the same shape: a running sentence is shown on the page, and the answers are placed inside the sentence at the relevant words. A visual stepper at the top of the form reflects the user's progress, with a completion dot on each tab whose required fields are filled.
 
-1. **Personal Info** — name, phone, role
-2. **Business Details** — business identity, type, size, location, categories
-3. **Preferences** — role-conditional buyer and/or supplier preferences
+### 3.1 Tab 1 — Personal Info
 
-The user can jump freely between tabs. The **Next** button is gated by per-tab validation (`canProceedToNext`, `onboarding-form.tsx:91-99`), and each tab's completion state is reflected visually in the stepper (`onboarding-form.tsx:231-256`).
+This tab captures the user's basic identity and the role they will play on the platform.
 
-After a successful save, a `WelcomeModal` opens with a 3-second auto-redirect countdown to `/dashboard` (`_components/WelcomeModal.tsx:18-31`).
+- **Name** — the user's display name, pre-filled from the session.
+- **Phone** — the user's contact number, digits-only and capped at eleven characters.
+- **Role** — the role being joined, chosen from *Store Owner*, *Supplier*, or *Both*. Defaults to *Store Owner*.
 
-### 3.1 Visual flow
+The **Next** button is enabled as soon as the name and phone are filled.
+
+### 3.2 Tab 2 — Business Details
+
+This tab captures the business identity and product focus.
+
+- **Business name** — the display name of the business.
+- **Business type** — one of ten operating models: *Retailer*, *Wholesaler*, *Manufacturer*, *Distributor*, *Importer*, *Exporter*, *Trader*, *Processor*, *Agro processor*, and *Apparel factory*.
+- **Business size** — one of four scale tiers: *Small*, *Medium*, *Large*, *Enterprise*.
+- **Years in business** — a numeric count of years the business has been operating. Optional.
+- **Area and district** — the business location.
+- **Primary category** — one of twenty-seven product lines (e.g. *Groceries*, *FMCG*, *Fresh produce*, *Electronics*, *Clothing*, *Pharmacy*, *Construction materials*, *Packaging*, *Chemicals*, *Plastics*, *Restaurant supply*, *Hospitality supply*, etc.).
+- **Sub-categories** — zero or more additional product lines from the same category list, used to mark secondary product lines.
+
+The **Next** button is enabled as soon as the business name, type, size, area, district, and primary category are all filled.
+
+### 3.3 Tab 3 — Preferences
+
+This tab renders one or two preference blocks depending on the chosen role. Each block is a single running sentence with the answers inline.
+
+#### Buyer block (shown for *Store Owner* and *Both*)
+
+The buyer block collects the user's buying profile:
+
+- **Monthly purchase range** — one of four spend bands, from *Under 500* to *10,000+*.
+- **Pricing preference** — one of four pricing tiers: *Budget*, *Value*, *Mid range*, *Premium*.
+- **Negotiation preference** — one of three styles: *Flexible*, *Fixed*, *No negotiation*.
+- **Buying priority** — one of five decision factors: *Low cost*, *Fast*, *Quality*, *Reliability*, *Consistency*.
+- **Restock frequency** — one of four cadences: *Weekly*, *Bi-weekly*, *Monthly*, *Seasonal*.
+- **Preferred distance** — one of six sourcing radii: *Neighborhood*, *Local*, *City*, *Regional*, *Nationwide*, *International*.
+- **Max delivery time** — one of five delivery windows: *Same day*, *Next day*, *2-3 days*, *Within week*, *Flexible*.
+
+#### Supplier block (shown for *Supplier* and *Both*)
+
+The supplier block collects the user's supply-side profile:
+
+- **Service area** — one of five coverage levels, from *Local* to *International*.
+- **Service radius in kilometres** — a numeric delivery radius. Optional.
+- **Delivery method** — one of five logistics modes: *Self delivery*, *Courier*, *Both*, *Pickup*, *Freight*.
+- **Delivery time range** — one of five promise windows, the same options as the buyer's max delivery time.
+- **Pricing type** — one of four pricing tiers, the same options as the buyer's pricing preference.
+- **Bulk discount availability** — whether the supplier offers bulk pricing: *Available* or *Not available*.
+- **Order capacity** — one of four scale tiers, reusing the business-size scale: *Small*, *Medium*, *Large*, *Enterprise*.
+- **Supplier tags** — zero or more of twelve trust and specialty flags: *Fast delivery*, *Bulk discount*, *Premium quality*, *Low price*, *Factory direct*, *Cash on delivery*, *VAT invoice*, *Halal certified*, *BSTI certified*, *Export ready*, *Cold chain*, *Sample available*.
+
+#### Role-conditional rendering
+
+The two blocks are rendered independently based on the role chosen in Tab 1:
+
+- *Store Owner* → only the buyer block.
+- *Supplier* → only the supplier block.
+- *Both* → both blocks, stacked, with the buyer block first and the supplier block second.
+
+### 3.4 Validation and gating
+
+- The **Next** button is disabled until the per-tab minimum fields are filled.
+- The stepper at the top of the form shows a completion dot on each tab whose required fields are filled, so the user can see progress at a glance and jump straight to a completed tab.
+- On the final tab, the **Complete Profile** button is disabled until the globally required fields across the whole form (name, phone, business name, business type, business size, district, area, primary category) are all filled. If anything is still missing when the user clicks it, a single-line error message appears listing the missing fields, and the user stays on the form.
+
+### 3.5 Save flow
+
+When the user clicks **Complete Profile**, the form:
+
+1. Validates the global required fields and shows an inline error if anything is missing.
+2. Coerces the numeric fields (years in business, service radius) into numbers when possible, leaving them blank otherwise.
+3. Sends the full payload to a server-side save endpoint.
+4. The server endpoint re-checks the session, normalises the input (trimming strings, mapping empty values to nothing, defaulting multi-value lists to empty), and writes it to the user record along with a flag that marks the user as onboarded.
+5. On success, a welcome panel opens. On failure, an inline error message is shown on the form so the user can correct the values and try again.
+
+---
+
+## 4. Data Collected
+
+The form gathers **26 fields** in total. They are grouped below by purpose, with the rationale and downstream usage for each. Field names are kept in their natural form so the table is easy to scan against the form.
+
+### 4.1 Identity and Contact
+
+| Field | Required | Description | Used later for |
+|---|---|---|---|
+| Name | yes | Display + identity name | Shown across chat, community posts, sales, supplier cards, and comments. |
+| Phone | yes | Real contact channel, digits-only, capped at eleven characters | Verification, contact by counterparties, future SMS features. |
+| Role | yes | *Store Owner*, *Supplier*, or *Both* | Drives which preference block renders, which dashboard the user lands on, permission checks, buyer↔supplier matching, hiding/showing *Sell* vs *Buy* CTAs, and role-scoped analytics. |
+
+### 4.2 Business Identity
+
+| Field | Required | Description | Used later for |
+|---|---|---|---|
+| Business name | yes | Display name of the business | Shown on listings, supplier cards, and sales invoices; turned into a shareable URL behind the scenes. |
+| Business type | yes | One of ten operating models (Retailer, Wholesaler, Manufacturer, Distributor, Importer, Exporter, Trader, Processor, Agro processor, Apparel factory) | Filtering suppliers, recommending compatible counterparties, and supply-chain analytics. |
+| Business size | yes | One of four scale tiers (Small, Medium, Large, Enterprise) | Pricing-tier eligibility, default for order capacity, trust score weighting. |
+| Years in business | optional | A numeric count of years operating | Trust / credibility signal — feeds verification gating, average-rating context, and supplier trust badges. |
+| District, area | yes | The locality where the business is based | Locality-based search, distance matching, region-specific dashboards, and future map features. |
+| Primary category | yes | One of twenty-seven product lines (Groceries, FMCG, Fresh produce, Electronics, Clothing, Pharmacy, etc.) | Category-scoped feed, supplier–buyer matching, product-listing defaults. |
+| Sub-categories | optional | Zero or more additional product lines from the same category list | Broader matching — when a buyer's primary category matches a supplier's sub-category, the match still surfaces. |
+
+### 4.3 Buyer Preferences (shown for *Store Owner* and *Both*)
+
+| Field | Required | Description | Used later for |
+|---|---|---|---|
+| Monthly purchase range | optional | One of four spend bands (Under 500, 500–2,000, 2,000–10,000, 10,000+) | Buyer spend tiering, recommended supplier scale, credit / payment-term hints. |
+| Pricing preference | optional | One of four pricing tiers (Budget, Value, Mid range, Premium) | Matched against the supplier's pricing type, filter feed by price band. |
+| Negotiation preference | optional | One of three styles (Flexible, Fixed, No negotiation) | Pre-filter suppliers who allow negotiation, surface chat UX cues. |
+| Buying priority | optional | One of five decision factors (Low cost, Fast, Quality, Reliability, Consistency) | Heavily weighted in match scoring — the buyer's #1 decision factor. |
+| Restock frequency | optional | One of four cadences (Weekly, Bi-weekly, Monthly, Seasonal) | Predictive restock reminders and smart-basket recommendations. |
+| Preferred distance | optional | One of six sourcing radii (Neighborhood, Local, City, Regional, Nationwide, International) | Geographic filter when showing suppliers. |
+| Max delivery time | optional | One of five delivery windows (Same day, Next day, 2–3 days, Within week, Flexible) | Hard filter — suppliers with slower delivery windows are de-prioritised. |
+
+### 4.4 Supplier Preferences (shown for *Supplier* and *Both*)
+
+| Field | Required | Description | Used later for |
+|---|---|---|---|
+| Service area | optional | One of five coverage levels (Local, City, Regional, Nationwide, International) | Reverse-geographic filter for matching buyers. |
+| Service radius in km | optional | A numeric delivery radius in kilometres | Map-based radius matching and precise locality filter. |
+| Delivery method | optional | One of five logistics modes (Self delivery, Courier, Both, Pickup, Freight) | Filtered by buyer preference (for example *I want pickup*). |
+| Delivery time range | optional | One of five promise windows, the same options as the buyer's max delivery time | Filtered against the buyer's max delivery time. |
+| Pricing type | optional | One of four pricing tiers, the same options as the buyer's pricing preference | Matched against the buyer's pricing preference. |
+| Bulk discount availability | optional | Whether the supplier offers bulk pricing | Buyer-side filter *show me only bulk-discount suppliers*. |
+| Order capacity | optional | One of four scale tiers, reusing the business-size scale | Prevents matches that exceed the supplier's physical capacity. |
+| Supplier tags | optional | Zero or more of twelve trust and specialty flags (Fast delivery, Bulk discount, Premium quality, Low price, Factory direct, Cash on delivery, VAT invoice, Halal certified, BSTI certified, Export ready, Cold chain, Sample available) | Multi-tag filtering, supplier card badges, and compliance / regulation filters (halal, BSTI, etc.). |
+
+### 4.5 Onboarded flag
+
+When the form is submitted successfully, the user record is also marked as **onboarded**. This flag is what the route guard uses on every visit to decide whether to show the form or send the user straight to the dashboard.
+
+---
+
+## 5. Welcome and Redirect
+
+After a successful save, a small **welcome panel** appears on top of the form:
+
+- It shows the product logo, a *Welcome aboard* headline, and a one-line confirmation message.
+- Below the message is a live **countdown** that starts at three and ticks down once per second.
+- When the countdown reaches zero, the user is automatically sent to the main app.
+
+If the user clicks anywhere outside the panel, the panel closes, but the user stays on the form so they can correct the values and try again.
+
+---
+
+## 6. End-to-End Flow
+
+1. The user signs up or logs in. Their session is created with the onboarded flag off and the role unset.
+2. The user lands on the onboarding page. The server-side route guard checks the session and the onboarded flag.
+   - If the user is not signed in, they are sent to the sign-in page.
+   - If the user is already onboarded with a real role, they are sent to the dashboard.
+   - Otherwise, the multi-tab form is rendered with the user's name pre-filled.
+3. The user moves through the three tabs. The Next button is gated by per-tab validation, and the stepper at the top reflects each tab's completion state.
+4. On the final tab, the role-conditional preference block(s) are shown. The user fills in the relevant fields and clicks **Complete Profile**.
+5. The form validates the globally required fields, coerces the numeric fields into numbers, and sends the payload to the server-side save endpoint.
+6. The server-side endpoint re-checks the session, normalises the input, and writes the full profile to the user record along with the onboarded flag.
+7. On success, the welcome panel opens, the countdown ticks down, and the user is sent to the dashboard.
+8. From here on, every subsequent visit to onboarding is short-circuited to the dashboard.
+
+### 6.1 Workflow Diagram
 
 ```mermaid
-flowchart TD
-    A[User signs up / logs in] --> B{Session valid?}
-    B -- No --> Z[Redirect to /login]
-    B -- Yes --> C{onboarded == true<br/>AND role != NONE?}
-    C -- Yes --> D[Redirect to /dashboard]
-    C -- No --> E[Render OnboardingForm<br/>page.tsx]
-    E --> F[Tab 1: Personal Info<br/>name, phone, role]
-    F -->|Next| G[Tab 2: Business Details<br/>businessName, type, size,<br/>location, primaryCategory]
-    G -->|Next| H[Tab 3: Preferences<br/>conditional on role]
-    H --> I[handleSubmit<br/>saveOnboarding server action]
-    I -->|ok: true| J[WelcomeModal<br/>3s countdown]
-    J --> K[Redirect to /dashboard]
-    I -->|ok: false| L[Show error inline]
-    L --> H
+flowchart TB
+    A([User signs up or logs in]) --> B{Session valid?}
+    B -- No  --> C[Redirect to sign-in]
+    B -- Yes --> D{Onboarded and real role?}
+    D -- Yes --> E[Redirect to dashboard]
+    D -- No  --> F[Render the multi-tab onboarding form<br/>name pre-filled from session]
+
+    F --> G[Tab 1: Personal Info<br/>name, phone, role]
+    G -->|Next| H[Tab 2: Business Details<br/>business name, type, size, location, primary category, sub-categories]
+    H -->|Next| I[Tab 3: Preferences<br/>role-conditional buyer and/or supplier block]
+
+    I --> J{Globally required fields filled?}
+    J -- No  --> K[Show inline error listing missing fields]
+    K --> I
+    J -- Yes --> L[Send the full payload to the server-side save endpoint]
+
+    L --> M[Server re-checks the session, normalises the input,<br/>and writes the full profile to the user record with onboarded = true]
+    M --> N[Return success]
+    N --> O[Open the welcome panel with a 3-second countdown]
+    O --> P([Auto-redirect to the dashboard])
 ```
 
-### 3.2 Role-based rendering in Tab 3
+Key things to read off the chart:
 
-```mermaid
-flowchart LR
-    R[Selected role] -->|STORE_OWNER| B[Buyer block only]
-    R -->|SUPPLIER| S[Supplier block only]
-    R -->|BOTH| BS[Both blocks<br/>stacked]
-```
-
-Logic at `onboarding-form.tsx:69-70`:
-
-```ts
-const showBuyerFields    = form.role === "STORE_OWNER" || form.role === "BOTH";
-const showSupplierFields = form.role === "SUPPLIER"    || form.role === "BOTH";
-```
+- The route guard sits in front of the form and decides between sign-in, dashboard, and the form.
+- The three tabs are presented in order, but the user can jump back and forth.
+- The preference tab is **role-conditional** — buyers see the buyer block, suppliers see the supplier block, and *Both* sees both.
+- The save happens on the server after a global validation pass; the welcome panel and the dashboard redirect are the only client-side steps after that.
 
 ---
 
-## 4. Data Collected — What, Why, and How It's Used
+## 7. Step-by-Step Summary (Quick Read)
 
-The form gathers **23 fields** in total. They are grouped below by purpose, with the type, rationale, and downstream usage for each.
-
-### 4.1 Identity & Contact
-
-| Field | Type | Required | Why collected | Used later for |
-|---|---|---|---|---|
-| `name` | string | yes | Display + identity | Shown across chat, community posts, sales, supplier cards, comments. |
-| `phone` | string, digits-only, max 11 | yes | Real contact channel | Stored unique on `User.phone` (`prisma/user.prisma:9`). Used for verification, contact by counterparties, future SMS features. |
-
-### 4.2 Role
-
-`role` ∈ `{STORE_OWNER, SUPPLIER, BOTH}` — required, defaults to `STORE_OWNER` (`onboarding-form.tsx:42`).
-
-- **Why:** Drives which preference block renders in Tab 3, and which dashboard surface the user lands on.
-- **Used later for:** Permission checks, buyer↔supplier matching, hiding/showing "Sell" vs "Buy" CTAs, role-scoped analytics, the `@@index([role, district, primaryCategory])` composite index on `User` (`prisma/user.prisma:89`).
-
-### 4.3 Business Identity
-
-| Field | Type | Why | Used later for |
-|---|---|---|---|
-| `businessName` | string | Display name of the business | Shown on listings, supplier cards, sales invoices. Slugged into `businessSlug` server-side for shareable URLs. |
-| `businessType` | enum (10 values) | Classifies operating model — Retailer, Wholesaler, Manufacturer, Distributor, Importer, Exporter, Trader, Processor, Agro processor, Apparel factory | Filtering suppliers, recommending compatible counterparties, supply-chain analytics. Index: `@@index([businessType, businessSize])` (`prisma/user.prisma:90`). |
-| `businessSize` | enum (SMALL / MEDIUM / LARGE / ENTERPRISE) | Scale signal | Pricing-tier eligibility, default for `orderCapacity`, trust score weighting. |
-| `yearsInBusiness` | optional int | Trust / credibility signal | `isVerified` gating, average-rating context, supplier trust badges. |
-| `district`, `area` | string | Geographic scope | Locality-based search, distance matching, region-specific dashboards, future map features. |
-| `primaryCategory` | enum (27 values) | Main product/business line | Category-scoped feed, supplier-buyer matching, product listing defaults. |
-| `subCategories` | string[] | Secondary product lines | Broader matching — when a buyer's primary category matches a supplier's sub-category, the match still surfaces. |
-
-### 4.4 Buyer Preferences (shown for `STORE_OWNER` and `BOTH`)
-
-| Field | Type | Why | Used later for |
-|---|---|---|---|
-| `monthlyPurchaseRange` | string (UNDER_500 / 500_2000 / 2000_10000 / 10000_PLUS) | Buyer spend capacity | Tiering, recommended supplier scale, credit/payment term hints. |
-| `pricingPreference` | enum (BUDGET / VALUE / MID_RANGE / PREMIUM) | Price tier the buyer operates in | Match against supplier `pricingType`, filter feed by price band. |
-| `negotiationPreference` | enum (FLEXIBLE / FIXED / NO_NEGOTIATION) | Willingness to negotiate | Pre-filter suppliers who allow negotiation, chat UX cues. |
-| `buyingPriority` | enum (CHEAP / FAST / QUALITY / RELIABILITY / CONSISTENCY) | The buyer's #1 decision factor | Ranked match scoring — the matching engine weights this heavily. |
-| `restockFrequency` | string (WEEKLY / BIWEEKLY / MONTHLY / SEASONAL) | Reorder cadence | Predictive restock reminders, smart-basket recommendations. |
-| `preferredDistance` | enum (NEIGHBORHOOD / LOCAL / CITY / REGIONAL / NATIONWIDE / INTERNATIONAL) | Max sourcing radius | Geographic filter when showing suppliers. |
-| `maxDeliveryTime` | enum (SAME_DAY / NEXT_DAY / 2-3_DAYS / WITHIN_WEEK / FLEXIBLE) | Urgency tolerance | Hard filter — suppliers with slower delivery windows are de-prioritized. |
-
-### 4.5 Supplier Preferences (shown for `SUPPLIER` and `BOTH`)
-
-| Field | Type | Why | Used later for |
-|---|---|---|---|
-| `serviceArea` | enum (LOCAL / CITY / REGIONAL / NATIONWIDE / INTERNATIONAL) | Where the supplier ships | Reverse-geographic filter for matching buyers. |
-| `serviceRadiusKm` | optional int | Numeric delivery radius (km) | Map-based radius matching, precise locality filter. |
-| `deliveryMethod` | enum (SELF / COURIER / BOTH / PICKUP / FREIGHT) | Logistics mode | Filtered by buyer preference (e.g. "I want pickup"). |
-| `deliveryTimeRange` | enum (same options as buyer) | Promise window | Filtered against buyer's `maxDeliveryTime`. |
-| `pricingType` | enum (BUDGET / VALUE / MID_RANGE / PREMIUM) | The price tier the supplier operates in | Matched against buyer's `pricingPreference`. |
-| `bulkDiscountAvailable` | boolean | Whether the supplier offers bulk pricing | Buyer-side filter "show me only bulk-discount suppliers". |
-| `orderCapacity` | enum (reuses BUSINESS_SIZE) | Max order size the supplier can fulfil | Prevents matches that exceed the supplier's physical capacity. |
-| `supplierTags` | enum[] (12 values) | Trust + specialty flags — `FAST_DELIVERY`, `BULK_DISCOUNT`, `PREMIUM_QUALITY`, `LOW_PRICE`, `FACTORY_DIRECT`, `CASH_ON_DELIVERY`, `VAT_INVOICE`, `HALAL_CERTIFIED`, `BSTI_CERTIFIED`, `EXPORT_READY`, `COLD_CHAIN`, `SAMPLE_AVAILABLE` | Multi-tag filtering, supplier card badges, compliance/regulation filters (halal, BSTI). |
-
-
----
-
-
-
-### 5 Data flow summary
-
-```mermaid
-sequenceDiagram
-    participant U as User
-    participant FE as OnboardingForm<br/>(client)
-    participant SA as saveOnboarding<br/>(server action)
-    participant DB as Prisma -> Postgres
-
-    U->>FE: Fills 3 tabs
-    FE->>FE: useTransition + validation
-    U->>FE: Clicks "Complete Profile"
-    FE->>SA: saveOnboarding(payload)
-    SA->>SA: auth() check
-    SA->>DB: user.update({ ..., onboarded: true })
-    DB-->>SA: ok
-    SA-->>FE: { ok: true }
-    FE->>U: WelcomeModal (3s)
-    FE->>U: router.push("/dashboard")
-```
-
-
-
-## 6. Step-by-Step Summary
-
-1. **User authenticates** (sign-up or login) — session is created with `onboarded: false`, `role: NONE`.
-2. **User lands on `/onboarding`** — `page.tsx` (server) runs `auth()`, blocks unauthenticated users, and short-circuits already-onboarded users to the dashboard.
-3. **Tab 1 — Personal Info** — user enters `name` (pre-filled from session), `phone` (digit-only, max 11), and `role` (Store Owner / Supplier / Both).
-4. **Tab 2 — Business Details** — user enters `businessName`, `businessType`, `businessSize`, optional `yearsInBusiness`, `area`, `district`, `primaryCategory`, and an optional list of `subCategories`.
-5. **Tab 3 — Preferences** — depending on the role, a Buyer block and/or a Supplier block is rendered. Each block collects the role-specific preference enums listed in §4.
-6. **Submit** — `saveOnboarding` server action runs an `auth()` check, calls `prisma.user.update` with all 23 fields, and sets `onboarded: true`.
-7. **Welcome modal** — appears with a 3-second countdown, then `router.push("/dashboard")` lands the user on the main app.
-8. **From here on** — every subsequent visit to `/onboarding` is auto-redirected to `/dashboard` because the guard sees `onboarded: true`.
+- Onboarding is the **first-time profile setup** that runs the moment a freshly signed-up user is ready to use the app.
+- A small server-side route guard decides whether the user sees the form, is sent to sign-in, or is sent straight to the dashboard.
+- The form is split into three tabs — **Personal Info**, **Business Details**, and **Preferences** — with the answers inline inside running sentences.
+- The **Preferences** tab is role-conditional: buyers see the buyer block, suppliers see the supplier block, and *Both* sees both.
+- 26 fields are collected in total, covering identity, contact, business identity, location, product categories, and role-specific preferences.
+- The Next button is gated by per-tab validation, and the stepper at the top shows each tab's completion state.
+- On the final tab, the **Complete Profile** button submits the form. The server-side endpoint re-checks the session, normalises the input, and writes the full profile to the user record with the onboarded flag set.
+- On success, a welcome panel opens with a three-second countdown, then the user is auto-redirected to the dashboard.
+- From here on, every visit to the onboarding page is short-circuited to the dashboard by the route guard.
