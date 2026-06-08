@@ -43,6 +43,36 @@ export interface PublicSmartBasketListItem extends SmartBasketListItem {
   ownerBusinessName: string | null;
 }
 
+export interface SmartBasketDetailItem {
+  id: string;
+  productId: string;
+  name: string;
+  category: Category | null;
+  sellingPrice: number;
+  imageLink: string | null;
+  quantity: number;
+  unit: StockUnit;
+  role: string;
+  reason: string | null;
+}
+
+export interface SmartBasketDetail {
+  id: string;
+  publicId: string;
+  title: string;
+  description: string | null;
+  isPublic: boolean;
+  baseTotal: number;
+  customTotal: number | null;
+  sourceCategory: Category | null;
+  createdAt: string;
+  updatedAt: string;
+  ownerId: string;
+  ownerName: string;
+  ownerBusinessName: string | null;
+  items: SmartBasketDetailItem[];
+}
+
 export interface SmartBasketSuggestionItem {
   id: string;
   name: string;
@@ -772,6 +802,56 @@ export async function getSmartBasket(basketId: string): Promise<SmartBasketListI
       category: item.product.category ?? null,
       sellingPrice: item.product.sellingPrice,
       imageLink: item.product.imageLink ?? null,
+    })),
+  };
+}
+
+export async function getSmartBasketDetail(basketId: string): Promise<SmartBasketDetail | null> {
+  const session = await auth();
+  const userId = session?.user?.id;
+  if (!userId) return null;
+
+  const basket = await prisma.smartBasket.findFirst({
+    where: {
+      id: basketId,
+      OR: [{ ownerId: userId }, { isPublic: true }],
+    },
+    include: {
+      owner: { select: { id: true, name: true, businessName: true } },
+      items: {
+        include: { product: true },
+        orderBy: { position: "asc" },
+      },
+    },
+  });
+
+  if (!basket) return null;
+
+  return {
+    id: basket.id,
+    publicId: basket.publicId,
+    title: basket.title,
+    description: basket.description ?? null,
+    isPublic: basket.isPublic,
+    baseTotal: basket.baseTotal,
+    customTotal: basket.customTotal ?? null,
+    sourceCategory: basket.sourceCategory ?? null,
+    createdAt: basket.createdAt.toISOString(),
+    updatedAt: basket.updatedAt.toISOString(),
+    ownerId: basket.owner.id,
+    ownerName: basket.owner.name,
+    ownerBusinessName: basket.owner.businessName ?? null,
+    items: basket.items.map((item) => ({
+      id: item.id,
+      productId: item.productId,
+      name: item.product.name,
+      category: item.product.category ?? null,
+      sellingPrice: item.product.sellingPrice,
+      imageLink: item.product.imageLink ?? null,
+      quantity: item.quantity,
+      unit: item.product.unit,
+      role: item.role,
+      reason: item.reason ?? null,
     })),
   };
 }
