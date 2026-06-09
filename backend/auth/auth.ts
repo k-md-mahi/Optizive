@@ -7,6 +7,10 @@ import bcrypt from "bcryptjs";
 import prisma from "@/lib/prisma";
 import { UserRole } from "@/prisma/generated/prisma/enums";
 
+class BannedUserError extends CredentialsSignin {
+  code = "banned_user";
+}
+
 const authConfig = {
   providers: [
     Google({
@@ -33,6 +37,10 @@ const authConfig = {
 
         if (!user || !user.password) {
           throw new CredentialsSignin("Invalid email or password.");
+        }
+
+        if (user.banned) {
+          throw new BannedUserError();
         }
 
         const isValid = await bcrypt.compare(password, user.password);
