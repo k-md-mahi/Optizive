@@ -104,6 +104,7 @@ export async function getAdminDashboardData() {
 export async function getAdminUsers() {
   await checkAdminAuth();
   const users = await prisma.user.findMany({
+    where: { role: { not: "ADMIN" } },
     orderBy: { createdAt: "desc" },
     select: {
       id: true,

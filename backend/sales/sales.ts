@@ -142,19 +142,25 @@ export async function listSales(query: SalesQuery = {}): Promise<SalesListRespon
   else if (query.sort === "customerName") orderBy.customerName = query.order || "asc";
   else orderBy.createdAt = query.order || "desc";
 
-  const [sales, total] = await Promise.all([
-    prisma.sale.findMany({
-      where,
-      orderBy,
-      skip,
-      take: limit,
-      include: {
-        items: { select: { id: true, quantity: true, totalPrice: true } },
-        buyer: { select: { id: true, businessName: true } },
-      },
-    }),
-    prisma.sale.count({ where }),
-  ]);
+  const allSales = await prisma.sale.findMany({
+    where,
+    orderBy,
+    include: {
+      items: { select: { id: true, quantity: true, totalPrice: true } },
+      buyer: { select: { id: true, businessName: true } },
+    },
+  });
+
+  const now = new Date();
+  allSales.sort((a, b) => {
+    const aFuture = a.createdAt > now ? 1 : 0;
+    const bFuture = b.createdAt > now ? 1 : 0;
+    if (aFuture !== bFuture) return aFuture - bFuture;
+    return b.createdAt.getTime() - a.createdAt.getTime();
+  });
+
+  const total = allSales.length;
+  const sales = allSales.slice(skip, skip + limit);
 
   return {
     sales: sales.map((s) => ({

@@ -16,7 +16,7 @@ function AuthForms() {
   const [loginPassword, setLoginPassword] = useState("");
   const [loginError, setLoginError] = useState<string | null>(() => {
     const err = searchParams.get("error");
-    if (err === "banned_user") return "Your account has been banned.";
+    if (err === "banned_user" || err === "AccessDenied") return "You are banned.";
     if (err) return "Invalid email or password.";
     return null;
   });
@@ -41,8 +41,8 @@ function AuthForms() {
         redirect: false,
       });
 
-      if (result?.error === "banned_user") {
-        setLoginError("Your account has been banned.");
+      if (result?.error === "AccessDenied" || result?.error === "banned_user") {
+        setLoginError("You are banned.");
         setIsLoggingIn(false);
         return;
       }
